@@ -1,0 +1,18 @@
+[project]
+name = "binance-trading-toolkit"
+version = "0.1.0"
+description = "Shared Binance USDS-M futures private-API client (signing, orders, native stop, position query) for multiple trading-bot projects"
+requires-python = ">=3.11"
+dependencies = [
+    "requests",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+
+[tool.setuptools.packages.find]
+include = ["binance_trading_toolkit*"]
