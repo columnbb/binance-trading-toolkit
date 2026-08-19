@@ -20,9 +20,14 @@
 **正式串接 `ed-seykota-systematic-trend-following` 之前，請先在 Binance
 Futures 測試網跑過至少一輪「查合約規格 → 開倉 → 掛原生停損 → 平倉」，
 確認回應格式跟這裡的解析邏輯（`OrderResult`、`extract_filters` 等）吻合。**
-測試網網址官方文件目前列的是 `https://demo-fapi.binance.com`，但坊間
-教學普遍還在用較舊的 `https://testnet.binancefuture.com`，兩個都沒實測
-過，請自己先確認哪個能通。
+
+**這組測試網金鑰跟 `sepa_vcp_screener` 用的現貨測試網金鑰是兩個完全獨立
+的系統，不能共用**（2026-08-20 查證）——帳號體系本身就是分開的，必須
+另外申請。目前官方主推的申請入口是「Demo Trading」：
+https://demo.binance.com/en/futures/BTCUSDT ——用你既有的真實 Binance
+帳號登入後切換到 Demo Trading 模式產生金鑰（會拿到虛擬資金），對應的
+API 網址是 `https://demo-fapi.binance.com`。較舊的 `testnet.binancefuture.com`
+入口可能還能用，但不是目前文件主推的路徑，兩個都還沒實際測試過連得通。
 
 ## 提供什麼、不提供什麼
 
