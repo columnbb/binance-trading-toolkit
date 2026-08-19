@@ -73,6 +73,35 @@ result = client.market_order("BTCUSDT", "BUY", 0.01)
 client.stop_market_close_position("BTCUSDT", "SELL", stop_price=60000.0, position_side="LONG")
 ```
 
+## 交易帳本、審計報表、真實下單驗證
+
+跟 `mexc-futures-toolkit` 同樣的三個模組，介面刻意保持一致：
+
+```python
+from binance_trading_toolkit import TradeLedger, generate_report, run_smoke_test
+
+ledger = TradeLedger("audit/trading_ledger.jsonl")
+
+# 真實小額（預設 100 USDT 名目）開倉 -> 掛原生停損 -> 查詢確認 -> 取消 -> 平倉。
+# 執行前會先檢查帳上沒有既有部位、換算出的金額沒超過上限；任何一步出錯
+# 都會嘗試緊急平倉/取消，收尾時再次確認帳上真的歸零。
+run_smoke_test(client, ledger, symbol="BTCUSDT", confirm=True)
+
+from binance_trading_toolkit.report import load_events
+report_text = generate_report(load_events("audit/trading_ledger.jsonl"))
+```
+
+```bash
+python -m binance_trading_toolkit.report --ledger audit/trading_ledger.jsonl --print
+```
+
+`run_smoke_test()` 內部已經處理好 Binance 特有的兩個坑：原生停損走 Algo
+Order API、市價單回應不帶成交明細（改用 `open_positions()` 查真正的進場
+價/量）。跟 `confirm` 一樣沒有預設值的還有安全機制本身——開跑前檢查沒有
+既有部位、金額上限、任一步出錯就緊急清倉、結束時確認帳上歸零，全部原封
+不動保留。**這支會送出真實訂單，執行前務必自己確認情境安全**（測試網
+帳號，或帳上沒有其他部位的小額子帳戶）。
+
 ## 已知會踩的坑
 
 - **條件單要走 Algo Order API，不是 `/fapi/v1/order`**（見上方驗證狀態）

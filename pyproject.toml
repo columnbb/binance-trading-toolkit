@@ -1,7 +1,7 @@
 [project]
 name = "binance-trading-toolkit"
-version = "0.1.0"
-description = "Shared Binance USDS-M futures private-API client (signing, orders, native stop, position query) for multiple trading-bot projects"
+version = "0.2.0"
+description = "Shared Binance USDS-M futures private-API client (signing, orders, native stop, position query, trade ledger, audit report, live smoke test) for multiple trading-bot projects"
 requires-python = ">=3.11"
 dependencies = [
     "requests",
