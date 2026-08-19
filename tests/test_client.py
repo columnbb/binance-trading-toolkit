@@ -93,6 +93,11 @@ class TestSigning:
         monkeypatch.setattr(client._session, "get", lambda url, **kw: FakeResponse({"symbols": []}))
         assert client.exchange_info() == {"symbols": []}
 
+    def test_ticker_price(self, monkeypatch):
+        client = BinanceFuturesClient(BinanceConfig())
+        monkeypatch.setattr(client._session, "get", lambda url, **kw: FakeResponse({"symbol": "BTCUSDT", "price": "63500.10"}))
+        assert client.ticker_price("BTCUSDT") == pytest.approx(63500.10)
+
 
 class TestOrders:
     def test_market_order_parses_fill(self, client, monkeypatch):
@@ -121,18 +126,55 @@ class TestOrders:
         captured = {}
 
         def fake_request(method, url, timeout):
+            captured["method"] = method
             captured["url"] = url
-            return FakeResponse({"orderId": 7, "status": "NEW"})
+            # 2026-08-20 用真實測試網驗證過的實際回應形狀（沒有 status 欄位，是 algoStatus）
+            return FakeResponse({"algoId": 7, "algoStatus": "NEW"})
 
         monkeypatch.setattr(client._session, "request", fake_request)
-        client.stop_market_close_position("BTCUSDT", "SELL", 60000.0, position_side="LONG")
+        result = client.stop_market_close_position("BTCUSDT", "SELL", 60000.0, position_side="LONG")
 
+        assert captured["method"] == "POST"
+        assert "/fapi/v1/algoOrder" in captured["url"]
         params = parse_qs(urlparse(captured["url"]).query)
+        assert params["algoType"] == ["CONDITIONAL"]
         assert params["type"] == ["STOP_MARKET"]
         assert params["closePosition"] == ["true"]
-        assert params["stopPrice"] == ["60000"]
+        assert params["triggerPrice"] == ["60000"]
         assert params["positionSide"] == ["LONG"]
         assert "quantity" not in params
+        assert "stopPrice" not in params
+        assert result.ok
+        assert result.order_id == 7
+        assert result.status == "NEW"
+
+    def test_cancel_algo_order_uses_algo_endpoint(self, client, monkeypatch):
+        captured = {}
+
+        def fake_request(method, url, timeout):
+            captured["method"] = method
+            captured["url"] = url
+            # 2026-08-20 用真實測試網驗證過的實際回應形狀
+            return FakeResponse({"algoId": 7, "clientAlgoId": "x", "code": "200", "msg": "success"})
+
+        monkeypatch.setattr(client._session, "request", fake_request)
+        result = client.cancel_algo_order("BTCUSDT", 7)
+
+        assert captured["method"] == "DELETE"
+        assert "/fapi/v1/algoOrder" in captured["url"]
+        params = parse_qs(urlparse(captured["url"]).query)
+        assert params["algoId"] == ["7"]
+        assert result.ok
+        assert result.status == "success"
+
+    def test_open_algo_orders(self, client, monkeypatch):
+        monkeypatch.setattr(
+            client._session, "request",
+            lambda method, url, timeout: FakeResponse([{"algoId": 7, "symbol": "BTCUSDT"}]),
+        )
+        orders = client.open_algo_orders("BTCUSDT")
+        assert len(orders) == 1
+        assert orders[0]["algoId"] == 7
 
     def test_cancel_order(self, client, monkeypatch):
         monkeypatch.setattr(

@@ -137,6 +137,10 @@ class BinanceFuturesClient:
     def exchange_info(self, symbol: str | None = None) -> dict:
         return self._public("/fapi/v1/exchangeInfo", {"symbol": symbol})
 
+    def ticker_price(self, symbol: str) -> float:
+        data = self._public("/fapi/v1/ticker/price", {"symbol": symbol})
+        return float(data["price"])
+
     def symbol_filters(self, symbol: str) -> dict[str, Any]:
         """從 ``exchange_info`` 找出指定合約的完整規格（含 filters 陣列）。"""
         info = self.exchange_info(symbol)
@@ -213,11 +217,21 @@ class BinanceFuturesClient:
 
         ``quantity`` 刻意不提供——``closePosition=true`` 時官方文件說明
         不能同時帶數量，交易所會自己抓當下的完整部位量。
+
+        **2026-08-20 用真實測試網帳號驗證過**：條件單（STOP_MARKET 等）
+        已經被 Binance 移到獨立的 Algo Order API（``/fapi/v1/algoOrder``），
+        原本文件裡寫的 ``/fapi/v1/order`` + ``type=STOP_MARKET`` 直接送
+        會被拒絕，回應 ``HTTP 400：Order type not supported for this
+        endpoint. Please use the Algo Order API endpoints instead.``——
+        這裡已經改用正確的端點，且參數名稱也不同：``triggerPrice`` 取代
+        ``stopPrice``。回傳的識別碼欄位是 ``algoId``，放進
+        ``OrderResult.order_id`` 讓呼叫端不用管底層欄位名稱差異。
         """
         try:
-            data = self._signed("POST", "/fapi/v1/order", {
+            data = self._signed("POST", "/fapi/v1/algoOrder", {
+                "algoType": "CONDITIONAL",
                 "symbol": symbol, "side": side, "type": "STOP_MARKET",
-                "stopPrice": _trim(stop_price), "closePosition": "true",
+                "triggerPrice": _trim(stop_price), "closePosition": "true",
                 "positionSide": position_side, "workingType": working_type,
             })
         except BinanceAPIError as exc:
@@ -225,10 +239,31 @@ class BinanceFuturesClient:
 
         return OrderResult(
             ok=True, symbol=symbol, side=side,
-            order_id=data.get("orderId"), status=data.get("status", ""), raw=data,
+            order_id=data.get("algoId"), status=data.get("algoStatus", ""), raw=data,
         )
 
+    def cancel_algo_order(self, symbol: str, algo_id: int) -> OrderResult:
+        """取消一張用 ``stop_market_close_position()`` 掛的條件單。
+        走 Algo Order API，跟一般訂單的 ``cancel_order()`` 是不同端點。
+
+        **2026-08-20 用真實測試網驗證過**：取消成功的回應是
+        ``{"algoId": ..., "code": "200", "msg": "success"}``，沒有
+        ``algoStatus`` 欄位——狀態改看 ``msg``。"""
+        try:
+            data = self._signed("DELETE", "/fapi/v1/algoOrder", {"symbol": symbol, "algoId": algo_id})
+        except BinanceAPIError as exc:
+            return OrderResult(ok=False, symbol=symbol, side="", error=str(exc))
+        return OrderResult(ok=True, symbol=symbol, side=data.get("side", ""),
+                            order_id=data.get("algoId", algo_id), status=str(data.get("msg", "")), raw=data)
+
+    def open_algo_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        """查詢目前掛著的條件單（含這裡掛的原生停損）。"""
+        data = self._signed("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol})
+        orders = data.get("orders", data) if isinstance(data, dict) else data
+        return orders if isinstance(orders, list) else []
+
     def cancel_order(self, symbol: str, order_id: int) -> OrderResult:
+        """取消一般訂單（市價/限價單）。條件單／原生停損請用 ``cancel_algo_order()``。"""
         try:
             data = self._signed("DELETE", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id})
         except BinanceAPIError as exc:
