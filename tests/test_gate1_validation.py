@@ -144,6 +144,20 @@ class TestCancelOrderFlow:
         # First attempt (main flow) + retry in the finally block.
         assert len(client.cancelled_order_ids) >= 2
 
+    def test_cancel_test_order_notional_clears_min_notional_after_step_rounding(self, ledger):
+        """Regression test for a real bug hit during a live demo-account run:
+        flooring the quantity to a coarse step_size undershot back below
+        min_notional and Binance rejected the order (HTTP 400 'notional must
+        be no smaller than 50'). Must round up, with margin, instead."""
+        client = FakeClient(positions=[], price=66000.0, filters={"filters": [
+            {"filterType": "PRICE_FILTER", "tickSize": "0.1"},
+            {"filterType": "LOT_SIZE", "stepSize": "0.001"},
+            {"filterType": "MIN_NOTIONAL", "notional": "50.0"},
+        ]})
+        run_gate1_validation(client, ledger, symbol="BTCUSDT", confirm=True)
+        cancel_test_order = client.limit_orders[0]
+        assert cancel_test_order["quantity"] * cancel_test_order["price"] >= 50.0
+
 
 class TestLeverageAndMarginType:
     def test_calls_both_with_configured_values(self, ledger):

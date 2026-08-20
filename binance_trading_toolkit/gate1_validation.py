@@ -120,10 +120,15 @@ def run_gate1_validation(
     safe_price = price * 0.5
     if tick_size:
         safe_price = math.floor(safe_price / tick_size) * tick_size
-    target_notional = max(min_notional or 0.0, 20.0)
+    # 20% buffer over min_notional, then round UP (not down) to the step
+    # size — flooring here was the bug: for a coarse step_size relative to
+    # price, flooring can undershoot back below min_notional (e.g. step=0.001
+    # BTC at a ~$30k safe_price is a ~$30 jump per step, easily enough to
+    # floor a $50-notional target down to $20-30 and get rejected).
+    target_notional = max(min_notional or 0.0, 20.0) * 1.2
     quantity = target_notional / safe_price
     if step_size:
-        quantity = math.floor(quantity / step_size) * step_size
+        quantity = math.ceil(quantity / step_size) * step_size
 
     cancel_order_id = None
     try:
