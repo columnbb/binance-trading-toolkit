@@ -40,6 +40,33 @@ HTTP 400：Order type not supported for this endpoint. Please use the Algo Order
 拿到虛擬資金），對應的 API 網址確認是 `https://demo-fapi.binance.com`
 （已實測連得通）。
 
+**2026-08-20 稍晚，同一組測試網帳號又跑了一輪 `run_gate1_validation()`**，
+補上 `run_smoke_test()` 沒涵蓋的三件事，全部成功，過程中另外抓到並修好
+兩個真的存在的 bug（都是先跑錯、看到真實回應才發現的，不是紙上談兵）：
+
+- **`limit_order()` 的 `quantity` 用 `floor` 捨到 `step_size` 會把名目金額
+  捨到 `MIN_NOTIONAL` 以下**，導致本來想測「先掛單再取消」的那張單直接被
+  拒單（`Order's notional must be no smaller than 50`）。改成用 1.2 倍
+  緩衝＋無條件進位。
+- **`newClientOrderId` 超過 Binance 36 字元上限**：把完整錯誤情境名稱
+  （例如 `below_min_notional`）嵌進 client order id 導致超長，三個錯誤
+  情境全部因為「Client order id length」被拒——不是原本想測的錯誤，是
+  這個 bug 把它們全部蓋住了。改成固定短前綴＋隨機值，情境名稱只留在
+  ledger 紀錄裡。
+
+修好之後三個目標全部驗證成功：`change_leverage`（真的把槓桿設成功）、
+`change_margin_type`（回應「已經是目標模式」，也是正常且已驗證的格式）、
+真實 `cancel_order()`（非 algo 端點，完整回應欄位都對過）、三種錯誤情境
+的真實回應格式：
+
+```
+低於 MIN_NOTIONAL   → Order's notional must be no smaller than 50 (unless you choose reduce only).
+價格精度錯誤        → Precision is over the maximum defined for this asset.
+保證金不足          → Margin is insufficient.
+```
+
+全程沒有任何一張單意外成交——所有下單都刻意掛在市價一半以下的 BUY 價位。
+
 ## 提供什麼、不提供什麼
 
 **提供：** 簽章、request wrapper、查行情/合約規格、查部位/餘額、下市價單/
@@ -151,6 +178,15 @@ result = run_gate1_validation(client, ledger, symbol="BTCUSDT", confirm=True,
   下單回應裡就同步帶回成交明細。要拿到實際成交價/量，得另外查詢部位
   （`open_positions()`）或查訂單狀態，`OrderResult.executed_qty`/
   `avg_price` 目前不能保證下單當下就有值。
+- **`newClientOrderId` 上限是 36 字元**，超過會被整張單拒絕（`Client
+  order id length should be less than 36 chars`），而且這個錯誤會蓋掉你
+  原本想測試的任何情境——2026-08-20 用 `run_gate1_validation()` 真的
+  踩到過，三個錯誤情境測試全部因為這個而失效，抓到才發現原因（見上方
+  驗證狀態）。
+- **把 `quantity` 用 `floor` 捨去到 `LOT_SIZE.stepSize` 時，`step_size`
+  夠粗的話會把名目金額（`quantity × price`）捨到 `MIN_NOTIONAL` 以下**，
+  導致原本以為合法的單被拒單。要保證下單合法，該用 `ceil` 進位並留一點
+  緩衝，不能只是「湊出一個略高於門檻的目標金額再往下捨」。
 
 ## 測試
 
