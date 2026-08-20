@@ -59,7 +59,8 @@ class FakeClient:
         return {"code": 200, "msg": "success"}
 
     def limit_order(self, symbol, side, quantity, price, *, position_side=None, new_client_order_id=None):
-        self.limit_orders.append({"side": side, "quantity": quantity, "price": price})
+        self.limit_orders.append({"side": side, "quantity": quantity, "price": price,
+                                   "new_client_order_id": new_client_order_id})
         if self.limit_order_should_fail:
             return FakeOrderResult(ok=False, error="rejected as configured by test")
         self.next_order_id += 1
@@ -128,6 +129,22 @@ class TestOrderPricingNeverRisksAFill:
         # in particular the min-notional case must not have pushed price up
         # to compensate for a small quantity.
         assert all(o["price"] <= safe_price + 0.5 for o in client.limit_orders)
+
+
+class TestClientOrderIdLength:
+    """Regression test for a real bug hit during a live demo-account run: a
+    client_order_id longer than Binance's 36-char limit made every error-case
+    order get rejected for the wrong reason (id-too-long), masking the actual
+    error the case was meant to trigger."""
+
+    def test_every_generated_client_order_id_is_36_chars_or_fewer(self, ledger):
+        client = FakeClient(positions=[])
+        run_gate1_validation(client, ledger, symbol="BTCUSDT", confirm=True)
+        assert client.limit_orders, "expected at least one limit order to be placed"
+        for order in client.limit_orders:
+            client_order_id = order["new_client_order_id"]
+            assert client_order_id is not None
+            assert len(client_order_id) <= 36, f"{client_order_id!r} is {len(client_order_id)} chars, exceeds Binance's limit"
 
 
 class TestCancelOrderFlow:

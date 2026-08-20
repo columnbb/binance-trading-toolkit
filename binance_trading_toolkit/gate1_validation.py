@@ -44,8 +44,14 @@ def _record_error_case(
         action=f"gate1_error_case_{case}", symbol=symbol, side=side, volume=quantity, live=True,
         order_type="LIMIT", parameters={"price": price, "expected": "rejected"},
     )
+    # Binance caps newClientOrderId at 36 chars. Don't embed the case name
+    # here (it's already on the ledger record via the `action` field above) —
+    # a real live run hit this: "below_min_notional"/"insufficient_margin"
+    # pushed the id past 36 chars, and every error case failed with a
+    # "Client order id length" rejection instead of the error being tested
+    # for, silently masking all three intended checks.
     result = client.limit_order(symbol, side, quantity, price, position_side=position_side,
-                                 new_client_order_id=f"gate1-{case}-{uuid.uuid4().hex[:16]}")
+                                 new_client_order_id=f"g1e-{uuid.uuid4().hex[:20]}")
     ledger.order_result(
         attempt_event_id=attempt, action=f"gate1_error_case_{case}", symbol=symbol, side=side,
         volume=quantity, status="unexpectedly_accepted" if result.ok else "rejected_as_expected",
@@ -136,7 +142,7 @@ def run_gate1_validation(
                                               volume=quantity, live=True, order_type="LIMIT",
                                               parameters={"price": safe_price})
         placed = client.limit_order(symbol, "BUY", quantity, safe_price, position_side=position_side,
-                                     new_client_order_id=f"gate1-cancel-{uuid.uuid4().hex[:16]}")
+                                     new_client_order_id=f"g1c-{uuid.uuid4().hex[:20]}")
         if not placed.ok:
             ledger.order_result(attempt_event_id=place_attempt, action="gate1_place_cancel_test_order",
                                  symbol=symbol, side="BUY", volume=quantity, status="failed", error=placed.error)
