@@ -113,6 +113,24 @@ class TestOrders:
         assert result.executed_qty == pytest.approx(0.01)
         assert result.avg_price == pytest.approx(63500.0)
 
+    def test_limit_order_sends_price_and_time_in_force(self, client, monkeypatch):
+        captured = {}
+
+        def fake_request(method, url, timeout):
+            captured["url"] = url
+            return FakeResponse({"orderId": 99, "status": "NEW", "executedQty": "0", "avgPrice": "0"})
+
+        monkeypatch.setattr(client._session, "request", fake_request)
+        result = client.limit_order("BTCUSDT", "BUY", 0.01, 25000.0)
+
+        params = parse_qs(urlparse(captured["url"]).query)
+        assert params["type"] == ["LIMIT"]
+        assert params["price"] == ["25000"]
+        assert params["timeInForce"] == ["GTC"]
+        assert result.ok
+        assert result.order_id == 99
+        assert result.avg_price is None
+
     def test_failed_order_returns_result_not_exception(self, client, monkeypatch):
         monkeypatch.setattr(
             client._session, "request",

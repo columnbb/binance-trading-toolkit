@@ -42,9 +42,9 @@ HTTP 400：Order type not supported for this endpoint. Please use the Algo Order
 
 ## 提供什麼、不提供什麼
 
-**提供：** 簽章、request wrapper、查行情/合約規格、查部位/餘額、下市價單、
-掛交易所端原生停損（`STOP_MARKET` + `closePosition=true`，Binance 官方的
-Close-All 機制）、取消訂單、調整槓桿/保證金模式。
+**提供：** 簽章、request wrapper、查行情/合約規格、查部位/餘額、下市價單/
+限價單、掛交易所端原生停損（`STOP_MARKET` + `closePosition=true`，Binance
+官方的 Close-All 機制）、取消一般訂單/條件單、調整槓桿/保證金模式。
 
 **不提供：** 策略邏輯、風控參數。這些留在各自專案裡。
 
@@ -68,6 +68,7 @@ client = BinanceFuturesClient(BinanceConfig(
 positions = client.open_positions("BTCUSDT")
 
 result = client.market_order("BTCUSDT", "BUY", 0.01)
+result = client.limit_order("BTCUSDT", "BUY", 0.01, price=60000.0)
 
 # 原生停損：多單用 side="SELL" 觸發市價平掉整個部位
 client.stop_market_close_position("BTCUSDT", "SELL", stop_price=60000.0, position_side="LONG")
@@ -101,6 +102,36 @@ Order API、市價單回應不帶成交明細（改用 `open_positions()` 查真
 既有部位、金額上限、任一步出錯就緊急清倉、結束時確認帳上歸零，全部原封
 不動保留。**這支會送出真實訂單，執行前務必自己確認情境安全**（測試網
 帳號，或帳上沒有其他部位的小額子帳戶）。
+
+## Gate 1 剩餘項目驗證：槓桿／保證金模式、真實 cancel_order、錯誤情境
+
+`run_smoke_test()` 沒涵蓋到的三件事，另外用 `run_gate1_validation()` 補：
+
+```python
+from binance_trading_toolkit import run_gate1_validation
+
+result = run_gate1_validation(client, ledger, symbol="BTCUSDT", confirm=True,
+                               leverage=5, margin_type="ISOLATED")
+```
+
+跑的東西：
+
+1. `change_leverage`／`change_margin_type`——預設值對齊 5 倍／逐倉，正常
+   情況下是冪等操作，不改變任何真實曝險。
+2. 真的掛一張限價單（刻意掛在市價**一半以下**的 BUY 價位，正常行情不可能
+   瞬間腰斬，成交風險視為零），再用 `cancel_order()`（一般單端點，不是
+   `cancel_algo_order()`）取消，驗證真實回應格式。
+3. 三種預期會被拒絕的錯誤情境——低於 `MIN_NOTIONAL`（用縮小數量而不是拉
+   高價格去湊,避免price 一路墊到可能成交的區間）、價格精度不對（在安全價
+   位上加不到一個 tick 的偏移）、保證金不足（同樣安全價位、數量刻意遠超
+   帳戶可用餘額）——全部掛在同一個不可能成交的安全價位，只是想觀察交易
+   所回什麼，不是真的想讓它成交。任何一個「意外被接受」的情境都會立刻
+   嘗試取消並記錄下來，不會靜默放著。
+
+跟 `run_smoke_test()` 一樣：**這支會送出真實請求，執行前務必自己確認情境
+安全**；跟 `run_smoke_test()` 不同的是這支不會開倉，最大的殘留風險只有
+「掛單後取消失敗」，`finally` 區塊會強制重試取消並查一次 `open_orders()`
+確認乾淨。
 
 ## 已知會踩的坑
 

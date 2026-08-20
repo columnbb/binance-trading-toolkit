@@ -203,6 +203,34 @@ class BinanceFuturesClient:
             raw=data,
         )
 
+    def limit_order(self, symbol: str, side: str, quantity: float, price: float, *,
+                     time_in_force: str = "GTC", reduce_only: bool = False,
+                     position_side: str | None = None, new_client_order_id: str | None = None) -> OrderResult:
+        """限價單。``side``：``BUY``/``SELL``。跟 ``market_order`` 走同一個
+        ``/fapi/v1/order`` 端點，只是 ``type=LIMIT`` 並多帶 ``price``/
+        ``timeInForce``。用途包括：真的掛一張刻意不會成交的單（驗證
+        ``cancel_order()``），或刻意送出會被拒絕的參數（驗證錯誤格式）
+        時，比 ``market_order`` 安全——不會有意外成交的風險。"""
+        try:
+            data = self._signed("POST", "/fapi/v1/order", {
+                "symbol": symbol, "side": side, "type": "LIMIT",
+                "timeInForce": time_in_force,
+                "quantity": _trim(quantity), "price": _trim(price),
+                "reduceOnly": "true" if reduce_only else None,
+                "positionSide": position_side,
+                "newClientOrderId": new_client_order_id,
+            })
+        except BinanceAPIError as exc:
+            return OrderResult(ok=False, symbol=symbol, side=side, error=str(exc))
+
+        return OrderResult(
+            ok=True, symbol=symbol, side=side,
+            order_id=data.get("orderId"), status=data.get("status", ""),
+            executed_qty=float(data.get("executedQty", 0) or 0),
+            avg_price=float(data["avgPrice"]) if data.get("avgPrice") not in (None, "0") else None,
+            raw=data,
+        )
+
     def stop_market_close_position(self, symbol: str, side: str, stop_price: float, *,
                                     position_side: str | None = None,
                                     working_type: str = "MARK_PRICE") -> OrderResult:
