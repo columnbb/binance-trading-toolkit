@@ -299,6 +299,33 @@ class BinanceFuturesClient:
         return OrderResult(ok=True, symbol=symbol, side=data.get("side", ""),
                             order_id=data.get("orderId"), status=data.get("status", ""), raw=data)
 
+    # ------------------------------------------------------------------
+    # 私有端點：已實現成交明細
+    # ------------------------------------------------------------------
+    def user_trades(self, symbol: str, *, order_id: int | None = None,
+                     start_time_ms: int | None = None, end_time_ms: int | None = None,
+                     limit: int = 500) -> list[dict[str, Any]]:
+        """``GET /fapi/v1/userTrades``——查詢已經結算過的真實成交紀錄，含
+        ``commission``／``commissionAsset``／``realizedPnl`` 這些下單當下的
+        即時回應（``market_order()`` 回傳的 ``OrderResult``）完全沒有的欄位。
+
+        2026-08-21 加：跟 mexc-futures-toolkit／my-crypto-bot 已經踩過的坑
+        一樣——``market_order()`` 送出後**立即**拿到的回應，``avgPrice``
+        不保證已經有值（成交確認可能有些微延遲），而且從來就沒有手續費
+        欄位。呼叫端如果直接拿下單當下的回應記帳（尤其是真錢交易），記錄
+        下來的價格/手續費可能是不完整或缺漏的估計值，不是交易所真正結算
+        的數字。這個方法搭配 ``confirmed_fill()`` 讓呼叫端可以在下單後
+        另外查一次，用交易所已經確認的真實成交資料入帳，取代自己假設的
+        滑價/手續費模型。
+
+        用 ``order_id`` 篩選只回傳屬於指定訂單的成交筆數（一張市價單可能
+        分好幾筆撮合成交）；不帶就回傳整個 symbol 最近的成交紀錄。
+        """
+        return self._signed("GET", "/fapi/v1/userTrades", {
+            "symbol": symbol, "orderId": order_id,
+            "startTime": start_time_ms, "endTime": end_time_ms, "limit": limit,
+        })
+
 
 def _trim(value: float) -> str:
     """去掉尾端的零——Binance 對過長的小數位會拒單（跟 MEXC 一樣的坑）。"""
@@ -330,3 +357,40 @@ def round_to_step(quantity: float, step: float | None) -> float:
         return quantity
     import math
     return math.floor(quantity / step) * step
+
+
+def confirmed_fill(trades: list[dict[str, Any]], order_id: int) -> dict[str, Any] | None:
+    """把 ``user_trades()`` 回傳的成交明細，篩出屬於指定 ``order_id`` 的那些筆，
+    彙總成這張訂單的確認成交資訊：成交量加權平均價、總成交量、總手續費。
+
+    設計成一個獨立的純函式（不打網路），是因為彙總邏輯本身值得單獨測試，
+    不用每次都真的發 HTTP 請求；呼叫端典型用法是
+    ``confirmed_fill(client.user_trades(symbol, order_id=oid), oid)``。
+
+    找不到屬於這個 ``order_id`` 的任何成交紀錄就回傳 ``None``——呼叫端要
+    自己決定退回哪個舊資料當 fallback（例如 ``market_order()`` 當下的
+    ``avgPrice``），不要把「查不到」誤判成「成交量是 0」。
+
+    手續費彙總只信任 ``commissionAsset`` 全部是 ``"USDT"`` 的情況——USDⓈ-M
+    合約預設用保證金資產（USDT）付手續費，但用 BNB 折扣付手續費時
+    ``commissionAsset`` 會是 ``"BNB"``，把不同資產的手續費直接加總會是
+    錯的假精確度。混到非 USDT 的手續費時，``commission`` 回傳 ``None``、
+    ``commission_asset_mismatch`` 標成 ``True``，讓呼叫端自己決定要換算
+    匯率還是退回估計值，這裡不代為決定。
+    """
+    matched = [t for t in trades if t.get("orderId") == order_id]
+    if not matched:
+        return None
+    total_qty = sum(float(t["qty"]) for t in matched)
+    if total_qty <= 0:
+        return None
+    avg_price = sum(float(t["price"]) * float(t["qty"]) for t in matched) / total_qty
+    commission_asset_mismatch = any(t.get("commissionAsset") != "USDT" for t in matched)
+    total_commission = None if commission_asset_mismatch else sum(float(t["commission"]) for t in matched)
+    return {
+        "avg_price": avg_price,
+        "quantity": total_qty,
+        "commission": total_commission,
+        "commission_asset_mismatch": commission_asset_mismatch,
+        "trade_count": len(matched),
+    }

@@ -22,6 +22,7 @@ from binance_trading_toolkit.client import (
     BinanceConfig,
     BinanceFuturesClient,
     OrderResult,
+    confirmed_fill,
     extract_filters,
     round_to_step,
 )
@@ -202,6 +203,68 @@ class TestOrders:
         result = client.cancel_order("BTCUSDT", 7)
         assert result.ok
         assert result.status == "CANCELED"
+
+
+class TestUserTrades:
+    def test_user_trades_filters_by_order_id_param(self, client, monkeypatch):
+        captured = {}
+
+        def fake_request(method, url, timeout):
+            captured["method"] = method
+            captured["url"] = url
+            return FakeResponse([{"orderId": 42, "price": "63500.0", "qty": "0.01",
+                                   "commission": "0.254", "commissionAsset": "USDT"}])
+
+        monkeypatch.setattr(client._session, "request", fake_request)
+        trades = client.user_trades("BTCUSDT", order_id=42)
+
+        assert captured["method"] == "GET"
+        assert "/fapi/v1/userTrades" in captured["url"]
+        params = parse_qs(urlparse(captured["url"]).query)
+        assert params["orderId"] == ["42"]
+        assert trades[0]["orderId"] == 42
+
+    def test_user_trades_without_order_id_omits_the_param(self, client, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(
+            client._session, "request",
+            lambda method, url, timeout: (captured.__setitem__("url", url), FakeResponse([]))[1],
+        )
+        client.user_trades("BTCUSDT")
+        params = parse_qs(urlparse(captured["url"]).query)
+        assert "orderId" not in params
+
+
+class TestConfirmedFill:
+    def test_aggregates_multiple_fills_into_weighted_average(self):
+        trades = [
+            {"orderId": 42, "price": "63000.0", "qty": "0.006", "commission": "0.15", "commissionAsset": "USDT"},
+            {"orderId": 42, "price": "63100.0", "qty": "0.004", "commission": "0.10", "commissionAsset": "USDT"},
+            {"orderId": 99, "price": "10.0", "qty": "100", "commission": "1.0", "commissionAsset": "USDT"},  # different order, must be excluded
+        ]
+        result = confirmed_fill(trades, 42)
+        assert result is not None
+        assert result["quantity"] == pytest.approx(0.01)
+        assert result["avg_price"] == pytest.approx((63000.0 * 0.006 + 63100.0 * 0.004) / 0.01)
+        assert result["commission"] == pytest.approx(0.25)
+        assert result["commission_asset_mismatch"] is False
+        assert result["trade_count"] == 2
+
+    def test_returns_none_when_order_id_not_found(self):
+        assert confirmed_fill([{"orderId": 1, "price": "1", "qty": "1", "commission": "0", "commissionAsset": "USDT"}], 999) is None
+
+    def test_returns_none_for_empty_trade_list(self):
+        assert confirmed_fill([], 42) is None
+
+    def test_non_usdt_commission_is_flagged_not_silently_summed(self):
+        trades = [
+            {"orderId": 42, "price": "63000.0", "qty": "0.01", "commission": "0.0001", "commissionAsset": "BNB"},
+        ]
+        result = confirmed_fill(trades, 42)
+        assert result["commission_asset_mismatch"] is True
+        assert result["commission"] is None
+        # avg_price/quantity are still trustworthy even when the fee currency isn't USDT
+        assert result["quantity"] == pytest.approx(0.01)
 
 
 class TestPositions:
