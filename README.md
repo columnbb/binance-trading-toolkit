@@ -67,6 +67,29 @@ HTTP 400：Order type not supported for this endpoint. Please use the Algo Order
 
 全程沒有任何一張單意外成交——所有下單都刻意掛在市價一半以下的 BUY 價位。
 
+**2026-08-21，用這個共用庫的 `ed-seykota-systematic-trend-following` 第一次真錢
+下單就撞到精度規則過期的問題**：BTCUSDT 的 `LOT_SIZE.stepSize` 在
+2026-08-20 驗證通過後不到 24 小時就被交易所從 `0.0001` 調整成 `0.001`，
+呼叫端（ed-seykota）自己快取的一份舊值沒有機制知道這件事，第一筆進場單
+直接被拒（`Precision is over the maximum defined for this asset`）——這個
+錯誤訊息其實是共用的，數量精度跟價格精度都會觸發同一句話，上面 8/20
+那次驗證只踩過價格精度那個情境（刻意測試用的），數量精度是這次才真的
+在生產環境撞到。
+
+**修法：`market_order()`／`limit_order()`／`stop_market_close_position()`
+現在會在送出每一筆訂單前，自動重新查一次交易所目前的
+`(tickSize, stepSize)`，用 `round_to_step()` 把數量/價格捨去對齊，不再要求
+呼叫端自己記得做這件事或自己維護一份可能過期的值。**刻意不快取——這個
+共用庫服務的是低頻的波段策略，下單頻率遠低於多一次公開 `exchangeInfo`
+查詢的成本，正確性優先於省這一次網路呼叫。查詢失敗會跟下單本身失敗走
+同一條路徑（`OrderResult(ok=False, ...)`），不會讓呼叫端多處理一種例外
+類型。
+
+這代表：**呼叫端不需要、也不應該再自己維護一份 `contract_size`／`tick_size`
+快取只為了「送單前對齊精度」這件事**——那件事現在是這個 client 自己的責任。
+呼叫端仍然可能需要知道目前的 `stepSize`（例如算部位大小、風控用的數量），
+這種情況請直接呼叫 `symbol_filters()`／`extract_filters()`。
+
 ## 提供什麼、不提供什麼
 
 **提供：** 簽章、request wrapper、查行情/合約規格、查部位/餘額、下市價單/

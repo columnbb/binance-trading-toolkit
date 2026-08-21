@@ -150,6 +150,28 @@ class BinanceFuturesClient:
                 return entry
         raise BinanceAPIError(f"exchangeInfo 找不到合約：{symbol}")
 
+    def _precision_for(self, symbol: str) -> tuple[float | None, float | None]:
+        """下單前的精度防護：即時查一次交易所目前的 ``(tick_size, step_size)``。
+
+        2026-08-21，用這個共用庫的 ed-seykota-systematic-trend-following 真錢
+        下單時撞到的教訓——交易所會不預警調整精度規則（BTCUSDT 的
+        ``LOT_SIZE.stepSize`` 在驗證通過後不到 24 小時就從 0.0001 變成
+        0.001），呼叫端如果自己快取一份舊值來算數量/價格，送出去的單很容易
+        跟交易所「現在」的規則對不上，被拒單（``"Precision is over the
+        maximum defined for this asset"``）——這個錯誤同時可能來自數量精度
+        或價格精度，過去只有前者被踩到並修過，後者（停損價要對齊
+        tickSize）是同一類問題、先前完全沒做這個防護。
+
+        刻意每次下單都重新查、不快取——這支客戶端服務的是低頻的波段策略
+        （4H K 棒等級的訊號），下單頻率遠低於多一次公開 API 呼叫的成本，
+        正確性優先於省這一次查詢。查詢失敗就讓例外往上傳給呼叫端的
+        ``try/except BinanceAPIError``，跟下單本身失敗走同一條錯誤處理
+        路徑（``OrderResult(ok=False, ...)``），不特別用另一套語意掩蓋
+        「查不到精度規則」這件事。
+        """
+        tick_size, step_size, _min_notional = extract_filters(self.symbol_filters(symbol))
+        return tick_size, step_size
+
     # ------------------------------------------------------------------
     # 私有端點：帳戶 / 部位
     # ------------------------------------------------------------------
@@ -183,8 +205,13 @@ class BinanceFuturesClient:
     def market_order(self, symbol: str, side: str, quantity: float, *,
                       reduce_only: bool = False, position_side: str | None = None,
                       new_client_order_id: str | None = None) -> OrderResult:
-        """市價單。``side``：``BUY``/``SELL``。"""
+        """市價單。``side``：``BUY``/``SELL``。呼叫端傳進來的 ``quantity``
+        會先用 ``_precision_for()`` 查到的即時 stepSize 重新捨去一次，不假設
+        呼叫端自己算的數量已經對齊當下的交易所規則（見 ``_precision_for``
+        的說明）。"""
         try:
+            _tick_size, step_size = self._precision_for(symbol)
+            quantity = round_to_step(quantity, step_size)
             data = self._signed("POST", "/fapi/v1/order", {
                 "symbol": symbol, "side": side, "type": "MARKET",
                 "quantity": _trim(quantity),
@@ -210,8 +237,14 @@ class BinanceFuturesClient:
         ``/fapi/v1/order`` 端點，只是 ``type=LIMIT`` 並多帶 ``price``/
         ``timeInForce``。用途包括：真的掛一張刻意不會成交的單（驗證
         ``cancel_order()``），或刻意送出會被拒絕的參數（驗證錯誤格式）
-        時，比 ``market_order`` 安全——不會有意外成交的風險。"""
+        時，比 ``market_order`` 安全——不會有意外成交的風險。
+
+        ``quantity``／``price`` 一樣會先用 ``_precision_for()`` 查到的即時
+        stepSize／tickSize 重新捨去，理由同 ``market_order``。"""
         try:
+            tick_size, step_size = self._precision_for(symbol)
+            quantity = round_to_step(quantity, step_size)
+            price = round_to_step(price, tick_size)
             data = self._signed("POST", "/fapi/v1/order", {
                 "symbol": symbol, "side": side, "type": "LIMIT",
                 "timeInForce": time_in_force,
@@ -254,8 +287,13 @@ class BinanceFuturesClient:
         這裡已經改用正確的端點，且參數名稱也不同：``triggerPrice`` 取代
         ``stopPrice``。回傳的識別碼欄位是 ``algoId``，放進
         ``OrderResult.order_id`` 讓呼叫端不用管底層欄位名稱差異。
+        ``stop_price`` 會先用 ``_precision_for()`` 查到的即時 tickSize 重新
+        捨去，理由同 ``market_order``——裸浮點數（例如 ATR 算出來的停損價）
+        幾乎不可能剛好是 tickSize 的整數倍，不做這一步幾乎必然被拒單。
         """
         try:
+            tick_size, _step_size = self._precision_for(symbol)
+            stop_price = round_to_step(stop_price, tick_size)
             data = self._signed("POST", "/fapi/v1/algoOrder", {
                 "algoType": "CONDITIONAL",
                 "symbol": symbol, "side": side, "type": "STOP_MARKET",

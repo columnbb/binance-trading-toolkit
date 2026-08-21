@@ -33,6 +33,17 @@ def client():
     return BinanceFuturesClient(BinanceConfig(api_key="test-key", api_secret="test-secret"))
 
 
+def _stub_precision(monkeypatch, client, *, tick_size=None, step_size=None):
+    """market_order()/limit_order()/stop_market_close_position() 現在每次下單
+    前都會呼叫 _precision_for() 查即時精度規則（見 client.py 的說明）——這是
+    一個獨立的公開 GET 請求，不是原本測試已經在 monkeypatch 的 _session.request
+    (那個只覆蓋 _signed() 用的方法)。這裡直接 stub 掉 _precision_for() 本身，
+    而不是連帶 stub _session.get，這樣既有測試只需要多一行就能繼續假設「精度
+    查詢回傳的值不影響它們原本要驗證的東西」（tick_size/step_size 預設 None，
+    round_to_step() 對 None 是 no-op，行為等同這個防護加上去之前）。"""
+    monkeypatch.setattr(client, "_precision_for", lambda symbol: (tick_size, step_size))
+
+
 class FakeResponse:
     def __init__(self, payload, status=200):
         self._payload = payload
@@ -47,6 +58,7 @@ class TestSigning:
     def test_signature_matches_hmac_of_query(self, client, monkeypatch):
         """跟 sepa_vcp_screener 的 TestSigning.test_signature_matches_hmac_of_query 對應。"""
         captured = {}
+        _stub_precision(monkeypatch, client)
 
         def fake_request(method, url, timeout):
             captured["url"] = url
@@ -102,6 +114,7 @@ class TestSigning:
 
 class TestOrders:
     def test_market_order_parses_fill(self, client, monkeypatch):
+        _stub_precision(monkeypatch, client)
         monkeypatch.setattr(
             client._session, "request",
             lambda method, url, timeout: FakeResponse({
@@ -114,8 +127,27 @@ class TestOrders:
         assert result.executed_qty == pytest.approx(0.01)
         assert result.avg_price == pytest.approx(63500.0)
 
+    def test_market_order_rounds_quantity_to_live_step_size(self, client, monkeypatch):
+        """2026-08-21 真實事故：呼叫端算出的數量（例如用一個過期的 step 假設）
+        不是交易所目前 stepSize 的整數倍時，Binance 會以 "Precision is over
+        the maximum defined for this asset" 拒單。這裡驗證 market_order()
+        會用即時查到的 stepSize 重新捨去，不是照單全收呼叫端傳進來的裸數字。"""
+        _stub_precision(monkeypatch, client, step_size=0.001)
+        captured = {}
+
+        def fake_request(method, url, timeout):
+            captured["url"] = url
+            return FakeResponse({"orderId": 1, "status": "NEW", "executedQty": "0", "avgPrice": "0"})
+
+        monkeypatch.setattr(client._session, "request", fake_request)
+        client.market_order("BTCUSDT", "BUY", 0.0018)  # 不是 0.001 的整數倍
+
+        params = parse_qs(urlparse(captured["url"]).query)
+        assert params["quantity"] == ["0.001"]  # 捨去到 0.001，不是拒單也不是照原樣送 0.0018
+
     def test_limit_order_sends_price_and_time_in_force(self, client, monkeypatch):
         captured = {}
+        _stub_precision(monkeypatch, client)
 
         def fake_request(method, url, timeout):
             captured["url"] = url
@@ -133,6 +165,7 @@ class TestOrders:
         assert result.avg_price is None
 
     def test_failed_order_returns_result_not_exception(self, client, monkeypatch):
+        _stub_precision(monkeypatch, client)
         monkeypatch.setattr(
             client._session, "request",
             lambda method, url, timeout: FakeResponse({"code": -2019, "msg": "Margin is insufficient."}, 400),
@@ -141,8 +174,21 @@ class TestOrders:
         assert result.ok is False
         assert "insufficient" in result.error
 
+    def test_order_fails_cleanly_when_precision_lookup_itself_fails(self, client, monkeypatch):
+        """精度查詢本身失敗（網路問題等）時，跟下單失敗走同一條路徑——回傳
+        OrderResult(ok=False)，不是讓例外整個往外炸、繞過呼叫端既有的失敗
+        處理邏輯（emergency flatten／SAFE_HALT 等都是接在 OrderResult.ok
+        上判斷的）。"""
+        def boom(symbol):
+            raise BinanceAPIError("HTTP 500：查詢失敗")
+        monkeypatch.setattr(client, "_precision_for", boom)
+        result = client.market_order("BTCUSDT", "BUY", 0.01)
+        assert result.ok is False
+        assert "查詢失敗" in result.error
+
     def test_stop_market_close_position_sends_close_all_params(self, client, monkeypatch):
         captured = {}
+        _stub_precision(monkeypatch, client)
 
         def fake_request(method, url, timeout):
             captured["method"] = method
@@ -166,6 +212,23 @@ class TestOrders:
         assert result.ok
         assert result.order_id == 7
         assert result.status == "NEW"
+
+    def test_stop_market_close_position_rounds_trigger_price_to_live_tick_size(self, client, monkeypatch):
+        """2026-08-21 真實發現：ATR 算出來的停損價幾乎不可能剛好是 tickSize
+        的整數倍，裸浮點數直接送出去很容易撞上跟數量精度一樣的
+        "Precision is over the maximum" 拒單，此前完全沒做這個防護。"""
+        _stub_precision(monkeypatch, client, tick_size=0.10)
+        captured = {}
+
+        def fake_request(method, url, timeout):
+            captured["url"] = url
+            return FakeResponse({"algoId": 8, "algoStatus": "NEW"})
+
+        monkeypatch.setattr(client._session, "request", fake_request)
+        client.stop_market_close_position("BTCUSDT", "SELL", 60000.37, position_side="LONG")
+
+        params = parse_qs(urlparse(captured["url"]).query)
+        assert params["triggerPrice"] == ["60000.3"]
 
     def test_cancel_algo_order_uses_algo_endpoint(self, client, monkeypatch):
         captured = {}
