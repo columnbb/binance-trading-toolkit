@@ -369,3 +369,66 @@ class TestFiltersAndRounding:
 def test_order_result_defaults():
     result = OrderResult(ok=False, symbol="X", side="BUY", error="boom")
     assert result.raw == {}
+
+
+class TestServerTimeSync:
+    def test_uses_lowest_rtt_midpoint_offset_for_next_signature(self, client, monkeypatch):
+        moments = iter([1000, 1040, 2000, 2010, 3000, 3080, 4000])
+        monkeypatch.setattr(client, "_epoch_ms", lambda: next(moments))
+        responses = iter([
+            {"serverTime": 1030},  # offset 10, RTT 40
+            {"serverTime": 2025},  # offset 20, RTT 10 -- select this sample
+            {"serverTime": 3045},  # offset 5, RTT 80
+        ])
+        monkeypatch.setattr(client._session, "get", lambda url, **kwargs: FakeResponse(next(responses)))
+        captured = {}
+        monkeypatch.setattr(
+            client._session,
+            "request",
+            lambda method, url, timeout: (captured.__setitem__("url", url), FakeResponse([]))[1],
+        )
+
+        diagnostics = client.sync_server_time(force=True)
+        client.account_balance()
+
+        params = parse_qs(urlparse(captured["url"]).query)
+        assert diagnostics["offset_ms"] == 20
+        assert diagnostics["last_rtt_ms"] == 10
+        assert params["timestamp"] == ["4020"]
+
+    def test_due_sync_failure_keeps_private_request_available_without_secret_leak(self, client, monkeypatch):
+        monkeypatch.setattr(client, "_epoch_ms", lambda: 1000)
+        monkeypatch.setattr(client._session, "get", lambda url, timeout: FakeResponse({"msg": "unavailable"}, 503))
+        diagnostics = client.sync_server_time_if_due()
+        assert diagnostics["last_error"] == "Binance public server time sync failed"
+        assert "signature" not in diagnostics["last_error"]
+
+    def test_recognizes_only_timestamp_rejections(self):
+        assert BinanceFuturesClient.is_timestamp_rejection(BinanceAPIError("HTTP 400: code -1021 timestamp ahead"))
+        assert BinanceFuturesClient.is_timestamp_rejection("Timestamp for this request is outside of the recvWindow")
+        assert not BinanceFuturesClient.is_timestamp_rejection(BinanceAPIError("HTTP 400: Invalid symbol"))
+
+    def test_transport_failure_in_preventive_sync_does_not_block_private_request(self, client, monkeypatch):
+        import requests
+
+        monkeypatch.setattr(client, "_epoch_ms", lambda: 1000)
+        monkeypatch.setattr(client._session, "get", lambda *args, **kwargs: (_ for _ in ()).throw(requests.RequestException("network down")))
+        captured = {}
+        monkeypatch.setattr(
+            client._session,
+            "request",
+            lambda method, url, timeout: (captured.__setitem__("url", url), FakeResponse([]))[1],
+        )
+
+        client.sync_server_time_if_due()
+        client.account_balance()
+
+        assert client.time_sync_diagnostics()["last_error"] == "Binance public server time sync failed"
+        assert "timestamp" in parse_qs(urlparse(captured["url"]).query)
+
+    def test_sync_uses_cached_result_within_interval(self, client, monkeypatch):
+        client._last_time_sync_ms = 1_000
+        client._time_offset_ms = 7
+        monkeypatch.setattr(client, "_epoch_ms", lambda: 1_100)
+        monkeypatch.setattr(client._session, "get", lambda *args, **kwargs: pytest.fail("must not resync"))
+        assert client.sync_server_time_if_due()["offset_ms"] == 7

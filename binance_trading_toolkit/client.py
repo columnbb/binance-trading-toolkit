@@ -51,6 +51,8 @@ class BinanceConfig:
     api_secret: str = ""
     timeout_seconds: int = 20
     recv_window_ms: int = 10_000
+    time_sync_interval_seconds: int = 300
+    time_sync_samples: int = 3
 
 
 @dataclass
@@ -78,6 +80,77 @@ class BinanceFuturesClient:
         self._session = session or requests.Session()
         if config.api_key:
             self._session.headers.update({"X-MBX-APIKEY": config.api_key})
+        self._time_offset_ms = 0
+        self._last_time_sync_ms: int | None = None
+        self._last_time_sync_rtt_ms: int | None = None
+        self._last_time_sync_error: str | None = None
+
+    def _epoch_ms(self) -> int:
+        return time.time_ns() // 1_000_000
+
+    def _time_sync_due(self) -> bool:
+        if self._last_time_sync_ms is None:
+            return True
+        interval_ms = max(1, int(self.config.time_sync_interval_seconds * 1000))
+        elapsed_ms = self._epoch_ms() - self._last_time_sync_ms
+        return elapsed_ms < 0 or elapsed_ms >= interval_ms
+
+    def _signed_timestamp_ms(self) -> int:
+        return self._epoch_ms() + self._time_offset_ms
+
+    def time_sync_diagnostics(self) -> dict[str, Any]:
+        return {
+            "offset_ms": self._time_offset_ms,
+            "last_sync_ms": self._last_time_sync_ms,
+            "last_rtt_ms": self._last_time_sync_rtt_ms,
+            "last_error": self._last_time_sync_error,
+        }
+
+    @staticmethod
+    def is_timestamp_rejection(error: BaseException | str) -> bool:
+        text = str(error).lower()
+        return "-1021" in text or ("timestamp" in text and ("ahead" in text or "outside" in text))
+
+    def sync_server_time(self, *, force: bool = False) -> dict[str, Any]:
+        """Synchronize a non-secret Binance clock offset using public server time.
+
+        The lowest-RTT sample is used so a delayed response does not bias the
+        signed timestamp. This method never signs a request or mutates orders.
+        """
+        if not force and not self._time_sync_due():
+            return self.time_sync_diagnostics()
+        samples: list[tuple[int, int, int]] = []
+        failures: list[str] = []
+        for _ in range(max(1, int(self.config.time_sync_samples))):
+            started_ms = self._epoch_ms()
+            try:
+                payload = self._public("/fapi/v1/time")
+                server_ms = int(payload["serverTime"])
+            except (KeyError, TypeError, ValueError, BinanceAPIError, requests.RequestException) as exc:
+                failures.append(str(exc))
+                continue
+            finished_ms = self._epoch_ms()
+            rtt_ms = max(0, finished_ms - started_ms)
+            midpoint_ms = (started_ms + finished_ms) // 2
+            samples.append((rtt_ms, server_ms - midpoint_ms, finished_ms))
+        if not samples:
+            self._last_time_sync_error = "Binance public server time sync failed"
+            raise BinanceAPIError(self._last_time_sync_error)
+        rtt_ms, offset_ms, synced_ms = min(samples, key=lambda item: item[0])
+        self._time_offset_ms = offset_ms
+        self._last_time_sync_ms = synced_ms
+        self._last_time_sync_rtt_ms = rtt_ms
+        self._last_time_sync_error = None
+        return self.time_sync_diagnostics()
+
+    def sync_server_time_if_due(self) -> dict[str, Any]:
+        """Best-effort preventive sync; a public endpoint outage never blocks a private request."""
+        if not self._time_sync_due():
+            return self.time_sync_diagnostics()
+        try:
+            return self.sync_server_time()
+        except BinanceAPIError:
+            return self.time_sync_diagnostics()
 
     # ------------------------------------------------------------------
     # 底層：簽章與請求
@@ -90,7 +163,7 @@ class BinanceFuturesClient:
         params = {
             k: v for k, v in {
                 **params,
-                "timestamp": int(time.time() * 1000),
+                "timestamp": self._signed_timestamp_ms(),
                 "recvWindow": self.config.recv_window_ms,
             }.items() if v is not None
         }
