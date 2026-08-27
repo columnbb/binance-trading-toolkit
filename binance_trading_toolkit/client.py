@@ -207,12 +207,19 @@ class BinanceFuturesClient:
             payload = response.json()
         except ValueError:
             payload = {"msg": response.text[:200]}
-        if response.status_code != 200:
-            # Keep Binance's non-secret error code because callers must
-            # distinguish explicit NO_SUCH_ORDER from a transport-unknown
-            # outcome. Never log the signed URL.
-            code = payload.get("code") if isinstance(payload, dict) else None
-            detail = payload.get("msg", payload) if isinstance(payload, dict) else payload
+        # Binance normally signals errors with a non-200 HTTP status, but some
+        # endpoints can return an HTTP 200 envelope containing a negative
+        # Binance error code.  Treat both forms as errors so a caller never
+        # mistakes a rejected operation for a completed one.  Keep the
+        # non-secret numeric code for fixed-ID absence classification, but
+        # never expose a signed URL here.
+        code = payload.get("code") if isinstance(payload, dict) else None
+        detail = payload.get("msg", payload) if isinstance(payload, dict) else payload
+        try:
+            numeric_code = int(code) if not isinstance(code, bool) else None
+        except (TypeError, ValueError):
+            numeric_code = None
+        if response.status_code != 200 or (numeric_code is not None and numeric_code < 0):
             code_fragment = f" code {code}" if code is not None else ""
             raise BinanceAPIError(f"HTTP {response.status_code}{code_fragment}：{detail}")
         return payload

@@ -107,6 +107,42 @@ class TestSigning:
         assert BinanceFuturesClient.is_order_not_found(info.value)
         assert not BinanceFuturesClient.is_order_not_found(BinanceAPIError("HTTP 503 code -1007: timeout"))
 
+    def test_http_200_negative_binance_code_is_rejected(self, client, monkeypatch):
+        monkeypatch.setattr(
+            client._session, "request",
+            lambda method, url, timeout: FakeResponse({"code": -2022, "msg": "Synthetic rejection"}, 200),
+        )
+        with pytest.raises(BinanceAPIError) as info:
+            client.account_balance()
+        assert "-2022" in str(info.value)
+        assert "Synthetic rejection" in str(info.value)
+        assert "signature" not in str(info.value)
+
+    def test_http_200_negative_no_such_order_preserves_explicit_absence(self, client, monkeypatch):
+        monkeypatch.setattr(
+            client._session, "request",
+            lambda method, url, timeout: FakeResponse({"code": -2013, "msg": "Order does not exist."}, 200),
+        )
+        with pytest.raises(BinanceAPIError) as info:
+            client.order_by_client_id("BTCUSDT", "seykota.entry.001")
+        assert BinanceFuturesClient.is_order_not_found(info.value)
+
+    def test_http_200_code_zero_remains_success(self, client):
+        payload = {"code": 0, "msg": "success"}
+        assert client._decode(FakeResponse(payload, 200)) == payload
+
+    def test_algo_http_200_negative_code_returns_failed_order_result(self, client, monkeypatch):
+        _stub_precision(monkeypatch, client, tick_size=0.1, step_size=0.001)
+        monkeypatch.setattr(
+            client._session, "request",
+            lambda method, url, timeout: FakeResponse({"code": -2022, "msg": "Synthetic rejection"}, 200),
+        )
+        result = client.stop_market_close_position(
+            "BTCUSDT", "SELL", 50000, client_algo_id="seykota.stop.001"
+        )
+        assert result.ok is False
+        assert "-2022" in result.error
+        assert "signature" not in result.error
 
     def test_missing_credentials_rejected(self):
         client = BinanceFuturesClient(BinanceConfig())
