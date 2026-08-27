@@ -122,6 +122,12 @@ class BinanceFuturesClient:
         text = str(error).lower()
         return "-1021" in text or ("timestamp" in text and ("ahead" in text or "outside" in text))
 
+    @staticmethod
+    def is_order_not_found(error: BaseException | str) -> bool:
+        """Return true only for Binance's explicit `-2013 NO_SUCH_ORDER` result."""
+        text = str(error).lower()
+        return "-2013" in text or "no_such_order" in text
+
     def sync_server_time(self, *, force: bool = False) -> dict[str, Any]:
         """Synchronize a non-secret Binance clock offset using public server time.
 
@@ -202,8 +208,13 @@ class BinanceFuturesClient:
         except ValueError:
             payload = {"msg": response.text[:200]}
         if response.status_code != 200:
-            # 只記錄交易所回的訊息，不記錄 URL（URL 含簽章）
-            raise BinanceAPIError(f"HTTP {response.status_code}：{payload.get('msg', payload)}")
+            # Keep Binance's non-secret error code because callers must
+            # distinguish explicit NO_SUCH_ORDER from a transport-unknown
+            # outcome. Never log the signed URL.
+            code = payload.get("code") if isinstance(payload, dict) else None
+            detail = payload.get("msg", payload) if isinstance(payload, dict) else payload
+            code_fragment = f" code {code}" if code is not None else ""
+            raise BinanceAPIError(f"HTTP {response.status_code}{code_fragment}：{detail}")
         return payload
 
     # ------------------------------------------------------------------

@@ -95,6 +95,18 @@ class TestSigning:
             client.account_balance()
         assert "signature" not in str(info.value)
         assert "Invalid symbol" in str(info.value)
+        assert "-1121" in str(info.value)
+
+    def test_explicit_no_such_order_is_distinguishable_from_unknown_errors(self, client, monkeypatch):
+        monkeypatch.setattr(
+            client._session, "request",
+            lambda method, url, timeout: FakeResponse({"code": -2013, "msg": "Order does not exist."}, 400),
+        )
+        with pytest.raises(BinanceAPIError) as info:
+            client.order_by_client_id("BTCUSDT", "seykota.entry.001")
+        assert BinanceFuturesClient.is_order_not_found(info.value)
+        assert not BinanceFuturesClient.is_order_not_found(BinanceAPIError("HTTP 503 code -1007: timeout"))
+
 
     def test_missing_credentials_rejected(self):
         client = BinanceFuturesClient(BinanceConfig())
