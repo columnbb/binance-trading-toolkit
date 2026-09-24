@@ -513,6 +513,35 @@ class TestStableClientIdentifiers:
         assert "orderId" not in params
         assert payload["status"] == "FILLED"
 
+    def test_order_by_id_queries_orderid_and_returns_the_client_order_id(self, client, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(
+            client._session, "request",
+            lambda method, url, timeout: (captured.update(method=method, url=url), FakeResponse({"orderId": 1142206692162, "clientOrderId": "sk-d7f3", "status": "FILLED"}))[1],
+        )
+
+        payload = client.order_by_id("BTCUSDT", "1142206692162")
+
+        params = parse_qs(urlparse(captured["url"]).query)
+        assert captured["method"] == "GET"
+        assert "/fapi/v1/order" in captured["url"]
+        assert params["orderId"] == ["1142206692162"]
+        assert "origClientOrderId" not in params
+        assert payload["clientOrderId"] == "sk-d7f3"
+
+    def test_order_by_id_rejects_a_non_numeric_id_before_any_request(self, client, monkeypatch):
+        monkeypatch.setattr(client._session, "request", lambda *a, **k: pytest.fail("no request expected"))
+        with pytest.raises(ValueError, match="numeric orderId"):
+            client.order_by_id("BTCUSDT", "sk-d7f3")
+
+    def test_order_by_id_raises_on_an_absent_order(self, client, monkeypatch):
+        monkeypatch.setattr(
+            client._session, "request",
+            lambda method, url, timeout: FakeResponse({"code": -2013, "msg": "Order does not exist."}, status=400),
+        )
+        with pytest.raises(BinanceAPIError, match="-2013"):
+            client.order_by_id("BTCUSDT", 42)
+
     def test_stop_order_sends_caller_fixed_client_algo_id(self, client, monkeypatch):
         _stub_precision(monkeypatch, client)
         captured = {}

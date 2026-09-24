@@ -464,6 +464,21 @@ class BinanceFuturesClient:
             "origClientOrderId": _validate_client_id(client_order_id, "client_order_id"),
         })
 
+    def order_by_id(self, symbol: str, order_id: int | str) -> dict[str, Any]:
+        """Read one ordinary order by its exchange ``orderId``.
+
+        Observation-only, like :meth:`order_by_client_id`.  Its use is the
+        reverse lookup: ``userTrades`` rows name the order but not the
+        ``clientOrderId`` it was sent with, and telling a strategy's own
+        duplicate send apart from an order placed elsewhere needs exactly
+        that (trade-alerts ``unrecorded_fill``).  An error -- ``-2013``
+        included -- is raised, never turned into an empty result.
+        """
+        text = str(order_id).strip()
+        if not text.isdigit():
+            raise ValueError(f"order_id must be a Binance numeric orderId, got {order_id!r}")
+        return self._signed("GET", "/fapi/v1/order", {"symbol": symbol, "orderId": int(text)})
+
     def cancel_order(self, symbol: str, order_id: int | None = None, *,
                      orig_client_order_id: str | None = None) -> OrderResult:
         """Cancel one ordinary order by exchange ID or stable client ID.

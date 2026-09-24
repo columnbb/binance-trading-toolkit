@@ -1,6 +1,6 @@
 [project]
 name = "binance-trading-toolkit"
-version = "0.3.2"
+version = "0.3.3"
 description = "Shared Binance USDⓈ-M futures client with stable-ID order observation, native stops, position query, and audit utilities"
 requires-python = ">=3.11"
 dependencies = [
