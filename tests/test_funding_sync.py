@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import math
 
 import pytest
 
+import binance_trading_toolkit.funding_sync as mod
 from binance_trading_toolkit.funding_sync import (
     DEFAULT_LOOKBACK_MS,
-    PAGE_SIZE,
     sync_funding_fees,
     total_funding_fee,
 )
@@ -23,23 +24,26 @@ def _row(time_ms, income="-0.01", tran=1, symbol="BTCUSDT", income_type="FUNDING
 
 
 class FakeClient:
-    """依 startTime／endTime 過濾，模擬 Binance 由舊到新、單頁上限的行為。"""
+    """依 startTime／endTime（含頭尾）過濾、再用 page／limit 切頁，
+    由舊到新排列——跟 Binance 的行為一致（含「同一毫秒可以有很多列」）。"""
 
-    def __init__(self, rows, page_size=PAGE_SIZE):
-        self.rows = sorted(rows, key=lambda r: r["time"])
-        self.page_size = page_size
+    def __init__(self, rows):
+        self.rows = rows
         self.calls = []
 
     def income_history(self, *, income_type=None, symbol=None, start_time_ms=None,
-                       end_time_ms=None, limit=1000):
+                       end_time_ms=None, limit=1000, page=None):
         self.calls.append({"income_type": income_type, "symbol": symbol,
-                           "start": start_time_ms, "end": end_time_ms, "limit": limit})
-        out = [r for r in self.rows
-               if (symbol is None or r["symbol"] == symbol)
-               and (income_type is None or r["incomeType"] == income_type)
-               and (start_time_ms is None or r["time"] >= start_time_ms)
-               and (end_time_ms is None or r["time"] <= end_time_ms)]
-        return out[: min(limit, self.page_size)]
+                           "start": start_time_ms, "end": end_time_ms, "limit": limit, "page": page})
+        out = sorted(
+            (r for r in self.rows
+             if (symbol is None or r["symbol"] == symbol)
+             and (income_type is None or r["incomeType"] == income_type)
+             and (start_time_ms is None or r["time"] >= start_time_ms)
+             and (end_time_ms is None or r["time"] <= end_time_ms)),
+            key=lambda r: (r["time"], r["tranId"]))
+        p = page or 1
+        return out[(p - 1) * limit: p * limit]
 
 
 @pytest.fixture
@@ -48,7 +52,13 @@ def ledger(tmp_path):
 
 
 def _events(ledger):
+    if not ledger.path.exists():
+        return []
     return [json.loads(l) for l in ledger.path.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+
+def _tran_ids(ledger):
+    return [e["tran_id"] for e in _events(ledger)]
 
 
 def test_writes_one_event_per_settlement_with_signed_amount(ledger):
@@ -62,28 +72,29 @@ def test_writes_one_event_per_settlement_with_signed_amount(ledger):
     assert events[0]["settle_time"].endswith("Z")
 
 
-def test_second_run_writes_nothing_and_resumes_after_last_settlement(ledger):
-    client = FakeClient([_row(NOW - 5000, tran=11)])
-    assert sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW) == 1
-    assert sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW) == 0
-    assert client.calls[-1]["start"] == NOW - 5000 + 1
-    assert len(_events(ledger)) == 1
-
-
-def test_first_run_looks_back_default_window(ledger):
+def test_first_run_looks_back_default_window_and_queries_funding_only(ledger):
     client = FakeClient([])
     sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW)
-    assert client.calls[0]["start"] == NOW - DEFAULT_LOOKBACK_MS
-    assert client.calls[0]["income_type"] == "FUNDING_FEE" and client.calls[0]["symbol"] == "BTCUSDT"
+    call = client.calls[0]
+    assert call["start"] == NOW - DEFAULT_LOOKBACK_MS and call["end"] == NOW
+    assert call["income_type"] == "FUNDING_FEE" and call["symbol"] == "BTCUSDT" and call["page"] == 1
     assert DEFAULT_LOOKBACK_MS < 90 * 24 * 3600 * 1000  # Binance only serves ~3 months
 
 
-def test_same_settlement_returned_twice_is_not_duplicated(ledger):
-    client = FakeClient([_row(NOW - 100, tran=7)])
-    sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW)
-    # start boundary overlap: re-serve the same row on a later run
-    client.rows.append(dict(client.rows[0]))
-    assert sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW, lookback_ms=10**9) == 0
+def test_rerun_with_overlapping_data_writes_nothing(ledger):
+    client = FakeClient([_row(NOW - 5000, tran=11), _row(NOW - 4000, tran=12)])
+    assert sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW) == 2
+    assert sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW) == 0
+    # start is inclusive of the newest recorded settlement, so the overlap row IS re-served
+    assert client.calls[-1]["start"] == NOW - 4000
+    assert any(r["time"] == NOW - 4000 for r in client.income_history(start_time_ms=NOW - 4000, end_time_ms=NOW))
+    assert _tran_ids(ledger) == [11, 12]
+
+
+def test_duplicate_rows_inside_one_response_are_written_once(ledger):
+    row = _row(NOW - 100, tran=7)
+    assert sync_funding_fees(FakeClient([row, dict(row)]), ledger, "BTCUSDT", now_ms=NOW) == 1
+    assert _tran_ids(ledger) == [7]
 
 
 def test_same_tran_id_at_different_times_or_symbols_are_distinct(ledger):
@@ -93,32 +104,99 @@ def test_same_tran_id_at_different_times_or_symbols_are_distinct(ledger):
     assert sync_funding_fees(client, ledger, "ETHUSDT", now_ms=NOW) == 1
 
 
-def test_pages_forward_when_a_page_is_full(ledger):
+def test_pages_use_page_param_over_a_fixed_window(ledger):
     rows = [_row(NOW - 10_000 + i * 10, tran=100 + i) for i in range(5)]
-    client = FakeClient(rows, page_size=2)
-    import binance_trading_toolkit.funding_sync as mod
-    old = mod.PAGE_SIZE
-    mod.PAGE_SIZE = 2
-    try:
-        assert sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW) == 5
-    finally:
-        mod.PAGE_SIZE = old
-    assert len(client.calls) == 3
-    assert [e["tran_id"] for e in _events(ledger)] == [100, 101, 102, 103, 104]
+    client = FakeClient(rows)
+    assert sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW, page_size=2) == 5
+    assert [c["page"] for c in client.calls] == [1, 2, 3]
+    assert len({(c["start"], c["end"]) for c in client.calls}) == 1  # window never moves
+    assert _tran_ids(ledger) == [100, 101, 102, 103, 104]
 
 
-def test_ignores_other_income_types(ledger):
-    client = FakeClient([_row(NOW - 100, income_type="COMMISSION", tran=1), _row(NOW - 90, tran=2)])
-    # fake filters by type, but a stray row must still be skipped by the module
-    client.income_history = lambda **kw: [_row(NOW - 100, income_type="COMMISSION", tran=1), _row(NOW - 90, tran=2)]
-    assert sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW) == 1
+def test_many_rows_on_the_same_millisecond_across_full_pages_are_all_recorded(ledger):
+    """審閱 F1：1001 列同一毫秒，第一頁 1000 列後不能漏掉第 1001 列。"""
+    same_ms = NOW - 5000
+    client = FakeClient([_row(same_ms, tran=i) for i in range(1, 1002)])
+    assert sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW) == 1001
+    assert sorted(_tran_ids(ledger)) == list(range(1, 1002))
+    assert sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW) == 0
 
 
-def test_unreadable_amount_raises_instead_of_writing_zero(ledger):
-    client = FakeClient([_row(NOW - 100, income="n/a")])
+def test_page_boundary_exactly_full_last_page_is_followed_by_an_empty_page(ledger):
+    client = FakeClient([_row(NOW - 100 + i, tran=i) for i in range(4)])
+    assert sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW, page_size=2) == 4
+    assert [c["page"] for c in client.calls] == [1, 2, 3]
+
+
+def test_interrupted_write_is_recovered_on_rerun_even_on_the_same_millisecond(ledger, monkeypatch):
+    """審閱 F1/F2：寫到一半被中斷，重跑要補回沒寫到的列（含同一毫秒的）。"""
+    t = NOW - 5000
+    client = FakeClient([_row(t - 10, tran=1), _row(t, tran=2), _row(t, tran=3), _row(t + 10, tran=4)])
+    real_append = ledger.append
+    state = {"n": 0}
+
+    def flaky(event_type, **fields):
+        state["n"] += 1
+        if state["n"] == 3:  # dies while writing the 3rd row (second row on millisecond t)
+            raise OSError("disk full")
+        return real_append(event_type, **fields)
+
+    monkeypatch.setattr(ledger, "append", flaky)
+    with pytest.raises(OSError):
+        sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW)
+    assert _tran_ids(ledger) == [1, 2]
+    monkeypatch.undo()
+    assert sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW) == 2
+    assert _tran_ids(ledger) == [1, 2, 3, 4]
+
+
+def test_bad_row_after_good_rows_writes_nothing_and_a_fixed_rerun_records_everything(ledger):
+    """審閱 F2：好列→壞列→修復重跑。"""
+    t = NOW - 5000
+    rows = [_row(t, income="-0.01", tran=1), _row(t, income="n/a", tran=2)]
+    client = FakeClient(rows)
     with pytest.raises(ValueError):
         sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW)
-    assert not ledger.path.exists() or _events(ledger) == []
+    assert _events(ledger) == []
+    rows[1]["income"] = "-0.02"
+    assert sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW) == 2
+    assert _tran_ids(ledger) == [1, 2]
+
+
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity", "nan", "inf", None, "", "n/a"])
+def test_non_finite_or_unreadable_amount_fails_closed(ledger, bad):
+    """審閱 F3。"""
+    client = FakeClient([_row(NOW - 200, income="-0.01", tran=1), _row(NOW - 100, income=bad, tran=2)])
+    with pytest.raises(ValueError):
+        sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW)
+    assert _events(ledger) == []
+
+
+@pytest.mark.parametrize("bad_time", [None, "x", 0, -5, float("nan"), float("inf"), True])
+def test_unreadable_time_fails_closed(ledger, bad_time):
+    client = FakeClient([_row(NOW - 100, tran=1)])
+    client.rows[0]["time"] = bad_time
+    client.income_history = lambda **kw: [dict(_row(NOW - 100, tran=1), time=bad_time)]
+    with pytest.raises(ValueError):
+        sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW)
+    assert _events(ledger) == []
+
+
+def test_exceeding_the_page_cap_fails_instead_of_syncing_partially(ledger, monkeypatch):
+    monkeypatch.setattr(mod, "MAX_PAGES", 3)
+    client = FakeClient([_row(NOW - 1000 + i, tran=i) for i in range(10)])
+    with pytest.raises(RuntimeError):
+        sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW, page_size=2)
+    assert _events(ledger) == []
+
+
+def test_ignores_other_income_types_and_writes_only_the_funding_row(ledger):
+    client = FakeClient([])
+    client.income_history = lambda **kw: [_row(NOW - 100, "-0.5", income_type="COMMISSION", tran=1),
+                                           _row(NOW - 90, "-0.02", tran=2)]
+    assert sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW) == 1
+    (event,) = _events(ledger)
+    assert event["tran_id"] == 2 and event["funding"] == -0.02
 
 
 def test_other_sources_do_not_push_the_start_time_forward(ledger):
@@ -128,10 +206,12 @@ def test_other_sources_do_not_push_the_start_time_forward(ledger):
     assert sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW) == 1
 
 
-def test_total_sums_only_usdt_funding(ledger):
+def test_total_sums_usdt_and_unlabelled_funding_but_not_other_assets(ledger):
     sync_funding_fees(FakeClient([_row(NOW - 3, "-0.5", tran=1), _row(NOW - 2, "0.2", tran=2),
                                    _row(NOW - 1, "9.0", tran=3, asset="BNB")]),
                       ledger, "BTCUSDT", now_ms=NOW)
+    ledger.append("funding_fee", record_id="legacy", symbol="BTCUSDT", funding=0.1)  # no asset label
     ledger.append("trade_open", trade_id="t", symbol="BTCUSDT")
-    assert total_funding_fee(str(ledger.path)) == pytest.approx(-0.3)
+    assert total_funding_fee(str(ledger.path)) == pytest.approx(-0.2)
+    assert total_funding_fee(str(ledger.path), asset="BNB") == pytest.approx(9.1)
     assert total_funding_fee(str(ledger.path.parent / "missing.jsonl")) == 0.0

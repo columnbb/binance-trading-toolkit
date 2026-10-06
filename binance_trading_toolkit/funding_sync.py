@@ -8,7 +8,8 @@
 只負責「查、去重、寫進帳本」；多久跑一次是呼叫端 systemd timer 的事。
 符號層級記錄，不嘗試歸屬到特定 trade_id（一次持倉可能跨好幾次結算）。
 
-``income``：正＝收到、負＝付出。官方只回最近 3 個月，所以第一次執行的
+``income``：正＝收到、負＝付出。分頁用固定時間窗加 ``page``，起點含頭並靠
+``record_id`` 去重，寫入前先整批驗證（見 ``sync_funding_fees``）。官方只回最近 3 個月，所以第一次執行的
 預設回看是 85 天（留一點餘裕給時間差），不是 MEXC 版的 30 天——這樣
 上線前已經累積、但從沒被記過的資金費也補得回來（補得回來的前提是還在
 3 個月內）。非 USDT 計價的列照記但標出 ``asset``，不會被當成 USDT 加總。
@@ -17,6 +18,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -26,6 +28,7 @@ from .ledger import TradeLedger
 
 DEFAULT_LOOKBACK_MS = 85 * 24 * 60 * 60 * 1000
 PAGE_SIZE = 1000
+MAX_PAGES = 1000  # safety valve: more than this means something is wrong, not "keep going"
 SOURCE = "binance_income"
 
 
@@ -70,60 +73,83 @@ def _existing_funding_state(ledger: TradeLedger, symbol: str) -> tuple[set[Any],
     return existing_ids, max_settle_ms
 
 
+def _fetch_window(client, symbol: str, start_time_ms: int, end_time_ms: int, page_size: int) -> list[dict[str, Any]]:
+    """同一個固定時間窗用 ``page`` 往後翻到最後一頁；整個窗口的資料都拿到才回傳。
+    不把 startTime 往前推——同一毫秒可以有好幾列，往前推會漏掉同毫秒尾端。"""
+    rows: list[dict[str, Any]] = []
+    for page in range(1, MAX_PAGES + 1):
+        got = client.income_history(
+            income_type="FUNDING_FEE", symbol=symbol,
+            start_time_ms=start_time_ms, end_time_ms=end_time_ms, limit=page_size, page=page,
+        )
+        rows.extend(got)
+        if len(got) < page_size:
+            return rows
+    raise RuntimeError(f"funding income for {symbol} exceeds {MAX_PAGES} pages; refusing a partial sync")
+
+
+def _validate(row: Any, symbol: str) -> tuple[str, float, int]:
+    """寫入前驗證；任何一列壞掉整輪就不寫。回傳 (record_id, funding, settle_ms)。"""
+    if not isinstance(row, dict):
+        raise ValueError(f"unreadable funding row for {symbol}: {row!r}")
+    settle_ms = row.get("time")
+    if isinstance(settle_ms, bool) or not isinstance(settle_ms, (int, float)) or not math.isfinite(settle_ms) or settle_ms <= 0:
+        raise ValueError(f"unreadable funding time {settle_ms!r} for {symbol}")
+    try:
+        funding = float(row.get("income"))
+    except (TypeError, ValueError):
+        raise ValueError(f"unreadable funding income {row.get('income')!r} for {symbol}")
+    if not math.isfinite(funding):
+        raise ValueError(f"non-finite funding income {row.get('income')!r} for {symbol}")
+    return _record_id(row, symbol), funding, int(settle_ms)
+
+
 def sync_funding_fees(
     client: BinanceFuturesClient, ledger: TradeLedger, symbol: str,
     *, lookback_ms: int = DEFAULT_LOOKBACK_MS, now_ms: int | None = None,
+    page_size: int = PAGE_SIZE,
 ) -> int:
     """查詢自上次記錄以來的新資金費結算，寫進帳本，回傳新寫入的筆數。
 
-    起點是這個 symbol 已記錄過（``source="binance_income"``）的最大結算時間
-    之後一毫秒；沒記錄過就用 ``lookback_ms`` 往回抓。``record_id`` 做二次
-    去重。只認 ``source="binance_income"`` 的既有事件，所以同一份帳本裡
-    別的來源（例如舊交易所留下的資金費列）不會讓起點被推到未來。
+    三個保證：
+    1. 整個時間窗（用 ``page`` 翻頁）全部取回、每一列都驗證通過才開始寫；
+       任何一列壞掉（金額不是有限數字、時間不可讀）整輪丟 ValueError、什麼都不寫。
+    2. 起點是已記錄的最大結算時間「本身」（含頭），不是＋1：同一毫秒還沒記到的
+       列下次會再被查到，靠 ``record_id`` 去重；寫入按時間由舊到新，所以中途被
+       中斷時，沒寫到的列時間一定不小於已寫的最大時間，重跑補得回來。
+    3. 只認 ``source="binance_income"`` 的既有事件決定起點，別的來源的列不會把
+       起點推到未來。
     """
     now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
     existing_ids, max_settle_ms = _existing_funding_state(ledger, symbol)
-    start_time_ms = (max_settle_ms + 1) if max_settle_ms is not None else (now_ms - lookback_ms)
+    start_time_ms = max_settle_ms if max_settle_ms is not None else (now_ms - lookback_ms)
 
-    new_count = 0
-    while True:
-        rows = client.income_history(
-            income_type="FUNDING_FEE", symbol=symbol,
-            start_time_ms=start_time_ms, end_time_ms=now_ms, limit=PAGE_SIZE,
+    rows = _fetch_window(client, symbol, start_time_ms, now_ms, page_size)
+    pending: list[tuple[int, str, float, dict[str, Any]]] = []
+    seen = set(existing_ids)
+    for row in rows:
+        if isinstance(row, dict) and row.get("incomeType") not in (None, "FUNDING_FEE"):
+            continue
+        record_id, funding, settle_ms = _validate(row, symbol)
+        if record_id in seen:
+            continue
+        seen.add(record_id)
+        pending.append((settle_ms, record_id, funding, row))
+
+    pending.sort(key=lambda item: (item[0], item[1]))
+    for settle_ms, record_id, funding, row in pending:
+        ledger.append(
+            "funding_fee",
+            record_id=record_id,
+            symbol=row.get("symbol") or symbol,
+            funding=funding,
+            asset=row.get("asset"),
+            tran_id=row.get("tranId"),
+            settle_time_ms=settle_ms,
+            settle_time=_iso_from_epoch_ms(settle_ms),
+            source=SOURCE,
         )
-        if not rows:
-            break
-        for row in rows:
-            if row.get("incomeType") not in (None, "FUNDING_FEE"):
-                continue
-            record_id = _record_id(row, symbol)
-            if record_id in existing_ids:
-                continue
-            try:
-                funding = float(row.get("income"))
-            except (TypeError, ValueError):
-                raise ValueError(f"unreadable funding income {row.get('income')!r} for {symbol}")
-            settle_ms = row.get("time")
-            ledger.append(
-                "funding_fee",
-                record_id=record_id,
-                symbol=row.get("symbol") or symbol,
-                funding=funding,
-                asset=row.get("asset"),
-                tran_id=row.get("tranId"),
-                settle_time_ms=int(settle_ms) if isinstance(settle_ms, (int, float)) else None,
-                settle_time=_iso_from_epoch_ms(settle_ms),
-                source=SOURCE,
-            )
-            existing_ids.add(record_id)
-            new_count += 1
-        if len(rows) < PAGE_SIZE:
-            break
-        last_ms = rows[-1].get("time")
-        if not isinstance(last_ms, (int, float)) or int(last_ms) + 1 <= start_time_ms:
-            break  # no forward progress possible; avoid looping forever
-        start_time_ms = int(last_ms) + 1
-    return new_count
+    return len(pending)
 
 
 def total_funding_fee(ledger_path: str, *, asset: str = "USDT") -> float:
