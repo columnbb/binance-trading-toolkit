@@ -1,0 +1,180 @@
+diff --git a/README.md b/README.md
+index 4846bc3..e409778 100644
+--- a/README.md
++++ b/README.md
+@@ -240,5 +240,9 @@ Binance 的資金費結算只出現在收益紀錄（`incomeType=FUNDING_FEE`）
+ 以 symbol＋時間＋tranId 去重（tranId 在不同收益類型間會重複，不能單獨當鍵）。
+ 官方只回最近 3 個月，第一次執行預設回看 85 天。
+ 
+-**驗證狀態：** 只在 Demo Trading 網址確認端點存在、參數被接受（當時區間沒有資金費列，
+-所以回應欄位以官方文件為準），正式站的資金費列尚未核對；單元測試用假客戶端回放。
++**驗證狀態（2026-10-06）：** 在 Demo 與正式站（A1 金鑰、唯讀）確認 `FUNDING_FEE` 列的欄位格式與官方文件
++一致（`symbol`／`incomeType`／`income` 字串／`asset`=USDT／`time` 毫秒／`tranId`／`tradeId` 空字串）；
++Demo 的 `page` 參數被接受（第 2 頁回空）；不存在的 ASCII 幣名會回 HTTP 400「Invalid symbol」，
++不指定 symbol 則是整個帳戶。**還沒驗過**多頁真實資料的分頁行為（正式站資料不到一頁）。
++`symbol=None` 是整個帳戶一次查，給專用帳戶用。帳本有壞行或尾端沒換行時一律 `FundingLedgerError`
++停手，要人工修復帳本後再跑。
+diff --git a/binance_trading_toolkit/client.py b/binance_trading_toolkit/client.py
+index 41fd567..6651d99 100644
+--- a/binance_trading_toolkit/client.py
++++ b/binance_trading_toolkit/client.py
+@@ -453,9 +453,9 @@ class BinanceFuturesClient:
+         1000 筆；時間邊界含頭尾。**分頁用 ``page``（固定同一個時間窗往後翻），
+         不要把 ``startTime`` 推到上一頁最後一筆之後**——同一毫秒可以有好幾列，
+         往前推會漏掉還沒回傳的同毫秒尾端。
+-        2026-10-06 只在 Demo Trading 網址確認端點存在、參數被接受（當時
+-        區間內沒有資金費列），正式站的回應格式尚未用真實資金費列核對；
+-        ``page`` 參數依官方文件，尚未實測。
++        2026-10-06 在 Demo 與正式站（唯讀）確認 ``FUNDING_FEE`` 列的欄位格式與上述一致；
++        Demo 接受 ``page``（第 2 頁回空）；不存在的 ASCII 幣名回 HTTP 400「Invalid symbol」；
++        不帶 ``symbol`` 就是整個帳戶。多頁真實資料的分頁行為尚未驗過。
+         """
+         return self._signed("GET", "/fapi/v1/income", {
+             "incomeType": income_type, "symbol": symbol,
+diff --git a/binance_trading_toolkit/funding_sync.py b/binance_trading_toolkit/funding_sync.py
+index 76110d3..52794b1 100644
+--- a/binance_trading_toolkit/funding_sync.py
++++ b/binance_trading_toolkit/funding_sync.py
+@@ -42,7 +42,7 @@ def _iso_from_epoch_ms(value: Any) -> str | None:
+     return datetime.fromtimestamp(milliseconds / 1000, tz=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+ 
+ 
+-def _record_id(row: dict[str, Any], symbol: str) -> str:
++def _record_id(row: dict[str, Any], symbol: str | None) -> str:
+     """tranId 在不同收益類型之間會重複（同一筆成交的手續費與已實現損益共用），
+     所以用 symbol＋時間＋tranId 組成去重鍵，不單靠 tranId。"""
+     return f"{row.get('symbol') or symbol}:{row.get('time')}:{row.get('tranId')}"
+@@ -63,12 +63,16 @@ def _read_events(ledger: TradeLedger) -> list[dict[str, Any]]:
+     if not ledger.path.exists():
+         return []
+     raw = ledger.path.read_bytes()
++    try:
++        text = raw.decode("utf-8")
++    except UnicodeDecodeError as exc:
++        raise FundingLedgerError(f"{ledger.path}: ledger is not valid UTF-8 ({exc.reason}); repair before syncing") from exc
+     if raw and not raw.endswith(b"\n"):
+         raise FundingLedgerError(
+             f"{ledger.path}: last line has no trailing newline (torn write?); repair the ledger before syncing"
+         )
+     events: list[dict[str, Any]] = []
+-    for number, line in enumerate(raw.decode("utf-8", errors="strict").splitlines(), 1):
++    for number, line in enumerate(text.splitlines(), 1):
+         if not line.strip():
+             continue
+         try:
+@@ -81,11 +85,11 @@ def _read_events(ledger: TradeLedger) -> list[dict[str, Any]]:
+     return events
+ 
+ 
+-def _existing_funding_state(ledger: TradeLedger, symbol: str) -> tuple[set[Any], int | None]:
++def _existing_funding_state(ledger: TradeLedger, symbol: str | None) -> tuple[set[Any], int | None]:
+     existing_ids: set[Any] = set()
+     max_settle_ms: int | None = None
+     for event in _read_events(ledger):
+-        if event.get("event_type") != "funding_fee" or event.get("symbol") != symbol:
++        if event.get("event_type") != "funding_fee" or (symbol is not None and event.get("symbol") != symbol):
+             continue
+         if event.get("source") != SOURCE:
+             continue
+@@ -98,7 +102,7 @@ def _existing_funding_state(ledger: TradeLedger, symbol: str) -> tuple[set[Any],
+     return existing_ids, max_settle_ms
+ 
+ 
+-def _fetch_window(client, symbol: str, start_time_ms: int, end_time_ms: int, page_size: int) -> list[dict[str, Any]]:
++def _fetch_window(client, symbol: str | None, start_time_ms: int, end_time_ms: int, page_size: int) -> list[dict[str, Any]]:
+     """同一個固定時間窗用 ``page`` 往後翻到最後一頁；整個窗口的資料都拿到才回傳。
+     不把 startTime 往前推——同一毫秒可以有好幾列，往前推會漏掉同毫秒尾端。"""
+     rows: list[dict[str, Any]] = []
+@@ -110,10 +114,10 @@ def _fetch_window(client, symbol: str, start_time_ms: int, end_time_ms: int, pag
+         rows.extend(got)
+         if len(got) < page_size:
+             return rows
+-    raise RuntimeError(f"funding income for {symbol} still not exhausted after {MAX_PAGES} pages; refusing a partial sync")
++    raise RuntimeError(f"funding income for {symbol or 'the whole account'} still not exhausted after {MAX_PAGES} pages; refusing a partial sync")
+ 
+ 
+-def _validate(row: Any, symbol: str) -> tuple[str, float, int]:
++def _validate(row: Any, symbol: str | None) -> tuple[str, float, int]:
+     """寫入前驗證；任何一列壞掉整輪就不寫。回傳 (record_id, funding, settle_ms)。"""
+     if not isinstance(row, dict):
+         raise ValueError(f"unreadable funding row for {symbol}: {row!r}")
+@@ -126,16 +130,22 @@ def _validate(row: Any, symbol: str) -> tuple[str, float, int]:
+         raise ValueError(f"unreadable funding income {row.get('income')!r} for {symbol}")
+     if not math.isfinite(funding):
+         raise ValueError(f"non-finite funding income {row.get('income')!r} for {symbol}")
++    if symbol is None and not (isinstance(row.get("symbol"), str) and row["symbol"]):
++        raise ValueError(f"funding row without a symbol in an account-wide sync: {row!r}")
+     return _record_id(row, symbol), funding, int(settle_ms)
+ 
+ 
+ def sync_funding_fees(
+-    client: BinanceFuturesClient, ledger: TradeLedger, symbol: str,
++    client: BinanceFuturesClient, ledger: TradeLedger, symbol: str | None,
+     *, lookback_ms: int = DEFAULT_LOOKBACK_MS, now_ms: int | None = None,
+     page_size: int = PAGE_SIZE,
+ ) -> int:
+     """查詢自上次記錄以來的新資金費結算，寫進帳本，回傳新寫入的筆數。
+ 
++    ``symbol=None`` 是整個帳戶一次查（專用帳戶用：不需要事先知道有哪些 symbol，
++    也不會因為帳本裡混有別的交易所時期的幣名而被「Invalid symbol」打斷）；起點與去重
++    都改看所有 ``source="binance_income"`` 的資金費事件。同一份帳本不要混用兩種模式。
++
+     四個保證：
+     1. 整個時間窗（用 ``page`` 翻頁）全部取回、每一列都驗證通過才開始寫；
+        任何一列壞掉（金額不是有限數字、時間不可讀）整輪丟 ValueError、什麼都不寫。
+diff --git a/tests/test_funding_sync.py b/tests/test_funding_sync.py
+index d8ea7ae..cf6f217 100644
+--- a/tests/test_funding_sync.py
++++ b/tests/test_funding_sync.py
+@@ -309,3 +309,51 @@ def test_total_refuses_a_damaged_ledger_instead_of_returning_a_short_number(ledg
+     _tear_tail(ledger)
+     with pytest.raises(FundingLedgerError):
+         total_funding_fee(str(ledger.path))
++
++
++# ---- 整個帳戶（symbol=None）模式與審閱留下的非阻擋事項 ----
++
++def test_account_wide_sync_records_every_symbol_and_is_idempotent(ledger):
++    rows = [_row(NOW - 300, "-0.1", tran=1, symbol="BTCUSDT"), _row(NOW - 200, "0.2", tran=2, symbol="ZENUSDT"),
++            _row(NOW - 100, "-0.3", tran=3, symbol="ETHUSDT")]
++    client = FakeClient(rows)
++    assert sync_funding_fees(client, ledger, None, now_ms=NOW) == 3
++    assert client.calls[0]["symbol"] is None and client.calls[0]["income_type"] == "FUNDING_FEE"
++    assert [e["symbol"] for e in _events(ledger)] == ["BTCUSDT", "ZENUSDT", "ETHUSDT"]
++    assert sync_funding_fees(client, ledger, None, now_ms=NOW) == 0
++    assert client.calls[-1]["start"] == NOW - 100  # newest settlement across ALL symbols, inclusive
++    assert total_funding_fee(str(ledger.path)) == pytest.approx(-0.2)
++
++
++def test_account_wide_resume_picks_up_a_late_row_on_the_newest_millisecond(ledger):
++    t = NOW - 100
++    client = FakeClient([_row(t, tran=1, symbol="BTCUSDT")])
++    assert sync_funding_fees(client, ledger, None, now_ms=NOW) == 1
++    client.rows.append(_row(t, tran=2, symbol="ZENUSDT"))
++    assert sync_funding_fees(client, ledger, None, now_ms=NOW) == 1
++    assert sorted(_tran_ids(ledger)) == [1, 2]
++
++
++def test_account_wide_sync_rejects_a_row_without_a_symbol(ledger):
++    client = FakeClient([])
++    bad = _row(NOW - 100, tran=1)
++    del bad["symbol"]
++    client.income_history = lambda **kw: [_row(NOW - 200, tran=2), bad]
++    with pytest.raises(ValueError):
++        sync_funding_fees(client, ledger, None, now_ms=NOW)
++    assert _events(ledger) == []
++
++
++def test_symbol_mode_still_ignores_other_symbols_in_the_ledger(ledger):
++    sync_funding_fees(FakeClient([_row(NOW - 100, tran=1, symbol="ETHUSDT")]), ledger, "ETHUSDT", now_ms=NOW)
++    client = FakeClient([_row(NOW - 500, tran=2, symbol="BTCUSDT")])
++    assert sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW) == 1
++    assert client.calls[0]["start"] == NOW - DEFAULT_LOOKBACK_MS  # ETH rows must not move BTC's start
++
++
++def test_invalid_utf8_in_the_ledger_is_a_ledger_error_not_a_unicode_error(ledger):
++    ledger.path.write_bytes(b'{"event_type": "x"}\n\xff\xfe\n')
++    with pytest.raises(FundingLedgerError):
++        sync_funding_fees(FakeClient([]), ledger, "BTCUSDT", now_ms=NOW)
++    with pytest.raises(FundingLedgerError):
++        total_funding_fee(str(ledger.path))

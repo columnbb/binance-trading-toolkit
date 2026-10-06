@@ -1,0 +1,23 @@
+diff --git a/.github/workflows/test.yml b/.github/workflows/test.yml
+new file mode 100644
+index 0000000..c1b54f9
+--- /dev/null
++++ b/.github/workflows/test.yml
+@@ -0,0 +1,17 @@
++name: test
++
++on:
++  push:
++    branches: [main, development]
++  pull_request:
++
++jobs:
++  pytest:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - uses: actions/setup-python@v5
++        with:
++          python-version: "3.11"
++      - run: pip install -e ".[dev]"
++      - run: pytest

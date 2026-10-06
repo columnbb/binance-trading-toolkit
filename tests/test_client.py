@@ -615,3 +615,32 @@ class TestStableClientIdentifiers:
             client.cancel_algo_order("BTCUSDT")
         with pytest.raises(ValueError, match="exactly one"):
             client.cancel_algo_order("BTCUSDT", 7, client_algo_id="seykota.stop.abc-1")
+
+
+class TestIncomeHistory:
+    def test_income_history_sends_type_symbol_and_window(self, client, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(
+            client._session, "request",
+            lambda method, url, timeout: (captured.update(method=method, url=url), FakeResponse([]))[1],
+        )
+        client.income_history(income_type="FUNDING_FEE", symbol="BTCUSDT",
+                              start_time_ms=1000, end_time_ms=2000, limit=500, page=3)
+        assert captured["method"] == "GET"
+        assert urlparse(captured["url"]).path == "/fapi/v1/income"
+        params = parse_qs(urlparse(captured["url"]).query)
+        assert params["incomeType"] == ["FUNDING_FEE"]
+        assert params["symbol"] == ["BTCUSDT"]
+        assert params["startTime"] == ["1000"] and params["endTime"] == ["2000"]
+        assert params["limit"] == ["500"] and params["page"] == ["3"]
+
+    def test_income_history_omits_unset_filters(self, client, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(
+            client._session, "request",
+            lambda method, url, timeout: (captured.update(url=url), FakeResponse([]))[1],
+        )
+        client.income_history()
+        params = parse_qs(urlparse(captured["url"]).query)
+        for key in ("incomeType", "symbol", "startTime", "endTime", "page"):
+            assert key not in params
