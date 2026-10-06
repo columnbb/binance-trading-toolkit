@@ -14,7 +14,10 @@ from .ledger import TradeLedger
 from .report import generate_report, load_events
 from .smoke_test import SmokeTestAborted, quantity_for_notional, run_smoke_test
 
-__version__ = "0.3.3"
+# Bump this (and pyproject.toml) whenever the code changes: pip treats an unchanged version
+# as already satisfied, so a persistent CI runner or host keeps the old code when only the
+# pinned commit moves (2026-10-06: momentum CI kept a 0.3.3 without funding_sync).
+__version__ = "0.4.0"
 
 __all__ = [
     "BinanceFuturesClient", "BinanceConfig", "BinanceAPIError", "OrderResult",
