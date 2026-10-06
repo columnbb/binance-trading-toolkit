@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -70,6 +71,16 @@ class OrderResult:
     raw: dict = field(default_factory=dict)
 
 
+_CLIENT_ID_PATTERN = re.compile(r"[.A-Za-z0-9_:/-]{1,36}")
+
+
+def _validate_client_id(value: str, field_name: str) -> str:
+    """Enforce Binance's documented client-ID syntax before signing a request."""
+    if not isinstance(value, str) or not _CLIENT_ID_PATTERN.fullmatch(value):
+        raise ValueError(f"{field_name} must match Binance client-ID format and be 1-36 characters")
+    return value
+
+
 class BinanceFuturesClient:
     """Binance USDⓈ-M 合約客戶端。金鑰只存在建構時傳入的 ``BinanceConfig``
     裡，呼叫端負責只從環境變數讀取、不要寫死。"""
@@ -110,6 +121,12 @@ class BinanceFuturesClient:
     def is_timestamp_rejection(error: BaseException | str) -> bool:
         text = str(error).lower()
         return "-1021" in text or ("timestamp" in text and ("ahead" in text or "outside" in text))
+
+    @staticmethod
+    def is_order_not_found(error: BaseException | str) -> bool:
+        """Return true only for Binance's explicit `-2013 NO_SUCH_ORDER` result."""
+        text = str(error).lower()
+        return "-2013" in text or "no_such_order" in text
 
     def sync_server_time(self, *, force: bool = False) -> dict[str, Any]:
         """Synchronize a non-secret Binance clock offset using public server time.
@@ -190,9 +207,21 @@ class BinanceFuturesClient:
             payload = response.json()
         except ValueError:
             payload = {"msg": response.text[:200]}
-        if response.status_code != 200:
-            # 只記錄交易所回的訊息，不記錄 URL（URL 含簽章）
-            raise BinanceAPIError(f"HTTP {response.status_code}：{payload.get('msg', payload)}")
+        # Binance normally signals errors with a non-200 HTTP status, but some
+        # endpoints can return an HTTP 200 envelope containing a negative
+        # Binance error code.  Treat both forms as errors so a caller never
+        # mistakes a rejected operation for a completed one.  Keep the
+        # non-secret numeric code for fixed-ID absence classification, but
+        # never expose a signed URL here.
+        code = payload.get("code") if isinstance(payload, dict) else None
+        detail = payload.get("msg", payload) if isinstance(payload, dict) else payload
+        try:
+            numeric_code = int(code) if not isinstance(code, bool) else None
+        except (TypeError, ValueError):
+            numeric_code = None
+        if response.status_code != 200 or (numeric_code is not None and numeric_code < 0):
+            code_fragment = f" code {code}" if code is not None else ""
+            raise BinanceAPIError(f"HTTP {response.status_code}{code_fragment}：{detail}")
         return payload
 
     # ------------------------------------------------------------------
@@ -282,6 +311,8 @@ class BinanceFuturesClient:
         會先用 ``_precision_for()`` 查到的即時 stepSize 重新捨去一次，不假設
         呼叫端自己算的數量已經對齊當下的交易所規則（見 ``_precision_for``
         的說明）。"""
+        if new_client_order_id is not None:
+            _validate_client_id(new_client_order_id, "new_client_order_id")
         try:
             _tick_size, step_size = self._precision_for(symbol)
             quantity = round_to_step(quantity, step_size)
@@ -314,6 +345,8 @@ class BinanceFuturesClient:
 
         ``quantity``／``price`` 一樣會先用 ``_precision_for()`` 查到的即時
         stepSize／tickSize 重新捨去，理由同 ``market_order``。"""
+        if new_client_order_id is not None:
+            _validate_client_id(new_client_order_id, "new_client_order_id")
         try:
             tick_size, step_size = self._precision_for(symbol)
             quantity = round_to_step(quantity, step_size)
@@ -339,7 +372,8 @@ class BinanceFuturesClient:
 
     def stop_market_close_position(self, symbol: str, side: str, stop_price: float, *,
                                     position_side: str | None = None,
-                                    working_type: str = "MARK_PRICE") -> OrderResult:
+                                    working_type: str = "MARK_PRICE",
+                                    client_algo_id: str | None = None) -> OrderResult:
         """掛一張交易所端原生停損單，觸發時**市價平掉整個部位**
         （``closePosition=true``，Binance 官方的「Close-All」機制，等同
         MEXC 那邊「綁在部位上的原生停損單」概念，但參數不同）。
@@ -364,6 +398,8 @@ class BinanceFuturesClient:
         捨去，理由同 ``market_order``——裸浮點數（例如 ATR 算出來的停損價）
         幾乎不可能剛好是 tickSize 的整數倍，不做這一步幾乎必然被拒單。
         """
+        if client_algo_id is not None:
+            _validate_client_id(client_algo_id, "client_algo_id")
         try:
             tick_size, _step_size = self._precision_for(symbol)
             stop_price = round_to_step(stop_price, tick_size)
@@ -372,6 +408,7 @@ class BinanceFuturesClient:
                 "symbol": symbol, "side": side, "type": "STOP_MARKET",
                 "triggerPrice": _trim(stop_price), "closePosition": "true",
                 "positionSide": position_side, "workingType": working_type,
+                "clientAlgoId": client_algo_id,
             })
         except BinanceAPIError as exc:
             return OrderResult(ok=False, symbol=symbol, side=side, error=str(exc))
@@ -381,15 +418,29 @@ class BinanceFuturesClient:
             order_id=data.get("algoId"), status=data.get("algoStatus", ""), raw=data,
         )
 
-    def cancel_algo_order(self, symbol: str, algo_id: int) -> OrderResult:
-        """取消一張用 ``stop_market_close_position()`` 掛的條件單。
-        走 Algo Order API，跟一般訂單的 ``cancel_order()`` 是不同端點。
+    def algo_order_by_client_id(self, symbol: str, client_algo_id: str) -> dict[str, Any]:
+        """Read one conditional order by its stable caller-supplied client ID.
 
-        **2026-08-20 用真實測試網驗證過**：取消成功的回應是
-        ``{"algoId": ..., "code": "200", "msg": "success"}``，沒有
-        ``algoStatus`` 欄位——狀態改看 ``msg``。"""
+        This is only an observation primitive.  A Binance error remains an
+        error, so callers never mistake a transport/authentication failure for
+        proof that a conditional order is absent.
+        """
+        return self._signed("GET", "/fapi/v1/algoOrder", {
+            "symbol": symbol,
+            "clientAlgoId": _validate_client_id(client_algo_id, "client_algo_id"),
+        })
+
+    def cancel_algo_order(self, symbol: str, algo_id: int | None = None, *,
+                          client_algo_id: str | None = None) -> OrderResult:
+        """Cancel one conditional order by exchange ID or stable client ID."""
+        if (algo_id is None) == (client_algo_id is None):
+            raise ValueError("provide exactly one of algo_id or client_algo_id")
+        params: dict[str, Any] = {"symbol": symbol, "algoId": algo_id}
+        if client_algo_id is not None:
+            params["clientAlgoId"] = _validate_client_id(client_algo_id, "client_algo_id")
+            params.pop("algoId")
         try:
-            data = self._signed("DELETE", "/fapi/v1/algoOrder", {"symbol": symbol, "algoId": algo_id})
+            data = self._signed("DELETE", "/fapi/v1/algoOrder", params)
         except BinanceAPIError as exc:
             return OrderResult(ok=False, symbol=symbol, side="", error=str(exc))
         return OrderResult(ok=True, symbol=symbol, side=data.get("side", ""),
@@ -401,14 +452,52 @@ class BinanceFuturesClient:
         orders = data.get("orders", data) if isinstance(data, dict) else data
         return orders if isinstance(orders, list) else []
 
-    def cancel_order(self, symbol: str, order_id: int) -> OrderResult:
-        """取消一般訂單（市價/限價單）。條件單／原生停損請用 ``cancel_algo_order()``。"""
+    def order_by_client_id(self, symbol: str, client_order_id: str) -> dict[str, Any]:
+        """Read one ordinary order by its stable caller-supplied client ID.
+
+        It is an observation-only request.  An error remains an error, so a
+        caller never mistakes a transport/authentication failure for proof
+        that an order is absent.
+        """
+        return self._signed("GET", "/fapi/v1/order", {
+            "symbol": symbol,
+            "origClientOrderId": _validate_client_id(client_order_id, "client_order_id"),
+        })
+
+    def order_by_id(self, symbol: str, order_id: int | str) -> dict[str, Any]:
+        """Read one ordinary order by its exchange ``orderId``.
+
+        Observation-only, like :meth:`order_by_client_id`.  Its use is the
+        reverse lookup: ``userTrades`` rows name the order but not the
+        ``clientOrderId`` it was sent with, and telling a strategy's own
+        duplicate send apart from an order placed elsewhere needs exactly
+        that (trade-alerts ``unrecorded_fill``).  An error -- ``-2013``
+        included -- is raised, never turned into an empty result.
+        """
+        text = str(order_id).strip()
+        if not text.isdigit():
+            raise ValueError(f"order_id must be a Binance numeric orderId, got {order_id!r}")
+        return self._signed("GET", "/fapi/v1/order", {"symbol": symbol, "orderId": int(text)})
+
+    def cancel_order(self, symbol: str, order_id: int | None = None, *,
+                     orig_client_order_id: str | None = None) -> OrderResult:
+        """Cancel one ordinary order by exchange ID or stable client ID.
+
+        Conditional orders remain on the separate Algo Order API and must use
+        :meth:`cancel_algo_order`.
+        """
+        if (order_id is None) == (orig_client_order_id is None):
+            raise ValueError("provide exactly one of order_id or orig_client_order_id")
+        params: dict[str, Any] = {"symbol": symbol, "orderId": order_id}
+        if orig_client_order_id is not None:
+            params["origClientOrderId"] = _validate_client_id(orig_client_order_id, "orig_client_order_id")
+            params.pop("orderId")
         try:
-            data = self._signed("DELETE", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id})
+            data = self._signed("DELETE", "/fapi/v1/order", params)
         except BinanceAPIError as exc:
             return OrderResult(ok=False, symbol=symbol, side="", error=str(exc))
         return OrderResult(ok=True, symbol=symbol, side=data.get("side", ""),
-                            order_id=data.get("orderId"), status=data.get("status", ""), raw=data)
+                            order_id=data.get("orderId", order_id), status=data.get("status", ""), raw=data)
 
     # ------------------------------------------------------------------
     # 私有端點：已實現成交明細

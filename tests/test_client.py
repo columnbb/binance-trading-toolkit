@@ -95,6 +95,54 @@ class TestSigning:
             client.account_balance()
         assert "signature" not in str(info.value)
         assert "Invalid symbol" in str(info.value)
+        assert "-1121" in str(info.value)
+
+    def test_explicit_no_such_order_is_distinguishable_from_unknown_errors(self, client, monkeypatch):
+        monkeypatch.setattr(
+            client._session, "request",
+            lambda method, url, timeout: FakeResponse({"code": -2013, "msg": "Order does not exist."}, 400),
+        )
+        with pytest.raises(BinanceAPIError) as info:
+            client.order_by_client_id("BTCUSDT", "seykota.entry.001")
+        assert BinanceFuturesClient.is_order_not_found(info.value)
+        assert not BinanceFuturesClient.is_order_not_found(BinanceAPIError("HTTP 503 code -1007: timeout"))
+
+    def test_http_200_negative_binance_code_is_rejected(self, client, monkeypatch):
+        monkeypatch.setattr(
+            client._session, "request",
+            lambda method, url, timeout: FakeResponse({"code": -2022, "msg": "Synthetic rejection"}, 200),
+        )
+        with pytest.raises(BinanceAPIError) as info:
+            client.account_balance()
+        assert "-2022" in str(info.value)
+        assert "Synthetic rejection" in str(info.value)
+        assert "signature" not in str(info.value)
+
+    def test_http_200_negative_no_such_order_preserves_explicit_absence(self, client, monkeypatch):
+        monkeypatch.setattr(
+            client._session, "request",
+            lambda method, url, timeout: FakeResponse({"code": -2013, "msg": "Order does not exist."}, 200),
+        )
+        with pytest.raises(BinanceAPIError) as info:
+            client.order_by_client_id("BTCUSDT", "seykota.entry.001")
+        assert BinanceFuturesClient.is_order_not_found(info.value)
+
+    def test_http_200_code_zero_remains_success(self, client):
+        payload = {"code": 0, "msg": "success"}
+        assert client._decode(FakeResponse(payload, 200)) == payload
+
+    def test_algo_http_200_negative_code_returns_failed_order_result(self, client, monkeypatch):
+        _stub_precision(monkeypatch, client, tick_size=0.1, step_size=0.001)
+        monkeypatch.setattr(
+            client._session, "request",
+            lambda method, url, timeout: FakeResponse({"code": -2022, "msg": "Synthetic rejection"}, 200),
+        )
+        result = client.stop_market_close_position(
+            "BTCUSDT", "SELL", 50000, client_algo_id="seykota.stop.001"
+        )
+        assert result.ok is False
+        assert "-2022" in result.error
+        assert "signature" not in result.error
 
     def test_missing_credentials_rejected(self):
         client = BinanceFuturesClient(BinanceConfig())
@@ -432,6 +480,141 @@ class TestServerTimeSync:
         monkeypatch.setattr(client, "_epoch_ms", lambda: 1_100)
         monkeypatch.setattr(client._session, "get", lambda *args, **kwargs: pytest.fail("must not resync"))
         assert client.sync_server_time_if_due()["offset_ms"] == 7
+
+
+class TestStableClientIdentifiers:
+    def test_market_order_sends_caller_fixed_client_id(self, client, monkeypatch):
+        _stub_precision(monkeypatch, client)
+        captured = {}
+        monkeypatch.setattr(
+            client._session, "request",
+            lambda method, url, timeout: (captured.update(method=method, url=url), FakeResponse({"orderId": 1, "status": "FILLED", "executedQty": "0.01", "avgPrice": "1"}))[1],
+        )
+
+        client.market_order("BTCUSDT", "BUY", 0.01, new_client_order_id="seykota.entry.abc-1")
+
+        params = parse_qs(urlparse(captured["url"]).query)
+        assert captured["method"] == "POST"
+        assert params["newClientOrderId"] == ["seykota.entry.abc-1"]
+
+    def test_order_query_uses_fixed_client_id_without_order_id(self, client, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(
+            client._session, "request",
+            lambda method, url, timeout: (captured.update(method=method, url=url), FakeResponse({"orderId": 1, "clientOrderId": "seykota.entry.abc-1", "status": "FILLED"}))[1],
+        )
+
+        payload = client.order_by_client_id("BTCUSDT", "seykota.entry.abc-1")
+
+        params = parse_qs(urlparse(captured["url"]).query)
+        assert captured["method"] == "GET"
+        assert "/fapi/v1/order" in captured["url"]
+        assert params["origClientOrderId"] == ["seykota.entry.abc-1"]
+        assert "orderId" not in params
+        assert payload["status"] == "FILLED"
+
+    def test_order_by_id_queries_orderid_and_returns_the_client_order_id(self, client, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(
+            client._session, "request",
+            lambda method, url, timeout: (captured.update(method=method, url=url), FakeResponse({"orderId": 1142206692162, "clientOrderId": "sk-d7f3", "status": "FILLED"}))[1],
+        )
+
+        payload = client.order_by_id("BTCUSDT", "1142206692162")
+
+        params = parse_qs(urlparse(captured["url"]).query)
+        assert captured["method"] == "GET"
+        assert "/fapi/v1/order" in captured["url"]
+        assert params["orderId"] == ["1142206692162"]
+        assert "origClientOrderId" not in params
+        assert payload["clientOrderId"] == "sk-d7f3"
+
+    def test_order_by_id_rejects_a_non_numeric_id_before_any_request(self, client, monkeypatch):
+        monkeypatch.setattr(client._session, "request", lambda *a, **k: pytest.fail("no request expected"))
+        with pytest.raises(ValueError, match="numeric orderId"):
+            client.order_by_id("BTCUSDT", "sk-d7f3")
+
+    def test_order_by_id_raises_on_an_absent_order(self, client, monkeypatch):
+        monkeypatch.setattr(
+            client._session, "request",
+            lambda method, url, timeout: FakeResponse({"code": -2013, "msg": "Order does not exist."}, status=400),
+        )
+        with pytest.raises(BinanceAPIError, match="-2013"):
+            client.order_by_id("BTCUSDT", 42)
+
+    def test_stop_order_sends_caller_fixed_client_algo_id(self, client, monkeypatch):
+        _stub_precision(monkeypatch, client)
+        captured = {}
+        monkeypatch.setattr(
+            client._session, "request",
+            lambda method, url, timeout: (captured.update(method=method, url=url), FakeResponse({"algoId": 7, "algoStatus": "NEW"}))[1],
+        )
+
+        client.stop_market_close_position("BTCUSDT", "SELL", 60000, client_algo_id="seykota.stop.abc-1")
+
+        params = parse_qs(urlparse(captured["url"]).query)
+        assert captured["method"] == "POST"
+        assert params["clientAlgoId"] == ["seykota.stop.abc-1"]
+
+    def test_algo_query_and_cancel_can_target_fixed_client_algo_id(self, client, monkeypatch):
+        captured = []
+
+        def fake_request(method, url, timeout):
+            captured.append((method, url))
+            return FakeResponse({"algoId": 7, "clientAlgoId": "seykota.stop.abc-1", "algoStatus": "NEW", "msg": "success"})
+
+        monkeypatch.setattr(client._session, "request", fake_request)
+        observed = client.algo_order_by_client_id("BTCUSDT", "seykota.stop.abc-1")
+        cancelled = client.cancel_algo_order("BTCUSDT", client_algo_id="seykota.stop.abc-1")
+
+        get_params = parse_qs(urlparse(captured[0][1]).query)
+        delete_params = parse_qs(urlparse(captured[1][1]).query)
+        assert captured[0][0] == "GET"
+        assert get_params["clientAlgoId"] == ["seykota.stop.abc-1"]
+        assert captured[1][0] == "DELETE"
+        assert delete_params["clientAlgoId"] == ["seykota.stop.abc-1"]
+        assert "algoId" not in delete_params
+        assert observed["algoId"] == 7
+        assert cancelled.ok
+
+    def test_cancel_regular_order_can_target_fixed_client_id(self, client, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(
+            client._session, "request",
+            lambda method, url, timeout: (captured.update(method=method, url=url), FakeResponse({"orderId": 7, "status": "CANCELED"}))[1],
+        )
+
+        result = client.cancel_order("BTCUSDT", orig_client_order_id="seykota.entry.abc-1")
+
+        params = parse_qs(urlparse(captured["url"]).query)
+        assert captured["method"] == "DELETE"
+        assert params["origClientOrderId"] == ["seykota.entry.abc-1"]
+        assert "orderId" not in params
+        assert result.ok
+
+    @pytest.mark.parametrize("method,args", [
+        ("market_order", ("BTCUSDT", "BUY", 0.01)),
+        ("order_by_client_id", ("BTCUSDT", "bad id with spaces")),
+        ("algo_order_by_client_id", ("BTCUSDT", "bad id with spaces")),
+    ])
+    def test_invalid_fixed_client_ids_are_rejected_before_request(self, client, monkeypatch, method, args):
+        monkeypatch.setattr(client._session, "request", lambda *args, **kwargs: pytest.fail("must not call Binance"))
+        if method == "market_order":
+            with pytest.raises(ValueError, match="new_client_order_id"):
+                client.market_order(*args, new_client_order_id="bad id with spaces")
+        else:
+            with pytest.raises(ValueError):
+                getattr(client, method)(*args)
+
+    def test_cancel_requires_exactly_one_stable_or_exchange_identifier(self, client):
+        with pytest.raises(ValueError, match="exactly one"):
+            client.cancel_order("BTCUSDT")
+        with pytest.raises(ValueError, match="exactly one"):
+            client.cancel_order("BTCUSDT", 7, orig_client_order_id="seykota.entry.abc-1")
+        with pytest.raises(ValueError, match="exactly one"):
+            client.cancel_algo_order("BTCUSDT")
+        with pytest.raises(ValueError, match="exactly one"):
+            client.cancel_algo_order("BTCUSDT", 7, client_algo_id="seykota.stop.abc-1")
 
 
 class TestIncomeHistory:
