@@ -230,3 +230,15 @@ python -m pytest -q
 目前的下單邏輯（`_send_entry`）本來就對真實下單有硬性擋機制
 （"protective stop-order integration must be verified first"），接進來時
 會保留這個安全機制，不會因為換了客戶端就解除。
+
+## 資金費同步（2026-10-06 加）
+
+`income_history()`（`GET /fapi/v1/income`）與 `funding_sync.sync_funding_fees()`：
+Binance 的資金費結算只出現在收益紀錄（`incomeType=FUNDING_FEE`），不在成交紀錄。
+`sync_funding_fees(client, ledger, symbol)` 介面與 mexc-futures-toolkit 同名函式一致，
+寫進帳本的是 `event_type="funding_fee"`（`funding` 正＝收到、負＝付出，`source="binance_income"`），
+以 symbol＋時間＋tranId 去重（tranId 在不同收益類型間會重複，不能單獨當鍵）。
+官方只回最近 3 個月，第一次執行預設回看 85 天。
+
+**驗證狀態：** 只在 Demo Trading 網址確認端點存在、參數被接受（當時區間沒有資金費列，
+所以回應欄位以官方文件為準），正式站的資金費列尚未核對；單元測試用假客戶端回放。

@@ -437,6 +437,31 @@ class BinanceFuturesClient:
             "startTime": start_time_ms, "endTime": end_time_ms, "limit": limit,
         })
 
+    # ------------------------------------------------------------------
+    # 私有端點：收益紀錄（資金費結算在這裡，不在 userTrades）
+    # ------------------------------------------------------------------
+    def income_history(self, *, income_type: str | None = None, symbol: str | None = None,
+                       start_time_ms: int | None = None, end_time_ms: int | None = None,
+                       limit: int = 1000, page: int | None = None) -> list[dict[str, Any]]:
+        """``GET /fapi/v1/income``——帳戶的收益流水：資金費（``FUNDING_FEE``）、
+        手續費、已實現損益等；回傳依時間由舊到新排列。
+
+        Binance 的資金費結算只出現在這個端點（不會出現在成交紀錄），每筆
+        結算一列：``symbol``／``incomeType``／``income``（正＝收到、負＝付出，
+        字串）／``asset``／``time``（毫秒）／``tranId``。官方限制：只回傳最近
+        3 個月；沒帶 ``startTime``／``endTime`` 時預設只回最近 7 天；單頁最多
+        1000 筆；時間邊界含頭尾。**分頁用 ``page``（固定同一個時間窗往後翻），
+        不要把 ``startTime`` 推到上一頁最後一筆之後**——同一毫秒可以有好幾列，
+        往前推會漏掉還沒回傳的同毫秒尾端。
+        2026-10-06 只在 Demo Trading 網址確認端點存在、參數被接受（當時
+        區間內沒有資金費列），正式站的回應格式尚未用真實資金費列核對；
+        ``page`` 參數依官方文件，尚未實測。
+        """
+        return self._signed("GET", "/fapi/v1/income", {
+            "incomeType": income_type, "symbol": symbol,
+            "startTime": start_time_ms, "endTime": end_time_ms, "limit": limit, "page": page,
+        })
+
 
 def _trim(value: float) -> str:
     """去掉尾端的零——Binance 對過長的小數位會拒單（跟 MEXC 一樣的坑）。"""
