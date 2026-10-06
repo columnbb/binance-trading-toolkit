@@ -10,6 +10,7 @@ import pytest
 import binance_trading_toolkit.funding_sync as mod
 from binance_trading_toolkit.funding_sync import (
     DEFAULT_LOOKBACK_MS,
+    FundingLedgerError,
     sync_funding_fees,
     total_funding_fee,
 )
@@ -215,3 +216,96 @@ def test_total_sums_usdt_and_unlabelled_funding_but_not_other_assets(ledger):
     assert total_funding_fee(str(ledger.path)) == pytest.approx(-0.2)
     assert total_funding_fee(str(ledger.path), asset="BNB") == pytest.approx(9.1)
     assert total_funding_fee(str(ledger.path.parent / "missing.jsonl")) == 0.0
+
+
+# ---- 審閱 F4：帳本本身被半筆寫入弄壞時要 fail closed，不能黏行、不能回報成功 ----
+
+def _tear_tail(ledger, partial='{"event_type": "funding_fee", "record_id": "BTCUSDT:'):
+    with ledger.path.open("a", encoding="utf-8") as handle:
+        handle.write(partial)  # no closing brace, no newline: what a killed append leaves behind
+
+
+def test_torn_tail_fails_closed_without_touching_the_ledger_or_the_exchange(ledger):
+    sync_funding_fees(FakeClient([_row(NOW - 30, tran=1)]), ledger, "BTCUSDT", now_ms=NOW)
+    _tear_tail(ledger)
+    before = ledger.path.read_bytes()
+    client = FakeClient([_row(NOW - 30, tran=1), _row(NOW - 20, tran=2), _row(NOW - 10, tran=3)])
+    with pytest.raises(FundingLedgerError):
+        sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW)
+    assert ledger.path.read_bytes() == before
+    assert client.calls == []  # failed before asking the exchange
+
+
+def test_unreadable_interior_line_fails_closed(ledger):
+    sync_funding_fees(FakeClient([_row(NOW - 30, tran=1)]), ledger, "BTCUSDT", now_ms=NOW)
+    with ledger.path.open("a", encoding="utf-8") as handle:
+        handle.write("{not json}\n")
+    sync_funding_fees_client = FakeClient([_row(NOW - 20, tran=2)])
+    with pytest.raises(FundingLedgerError):
+        sync_funding_fees(sync_funding_fees_client, ledger, "BTCUSDT", now_ms=NOW)
+
+
+def test_complete_json_without_trailing_newline_also_fails_closed(ledger):
+    ledger.path.write_text(json.dumps({"event_type": "trade_open", "trade_id": "t"}), encoding="utf-8")
+    with pytest.raises(FundingLedgerError):
+        sync_funding_fees(FakeClient([_row(NOW - 20, tran=2)]), ledger, "BTCUSDT", now_ms=NOW)
+
+
+def test_non_object_line_fails_closed(ledger):
+    ledger.path.write_text("[1, 2]\n", encoding="utf-8")
+    with pytest.raises(FundingLedgerError):
+        sync_funding_fees(FakeClient([]), ledger, "BTCUSDT", now_ms=NOW)
+
+
+def test_real_partial_append_is_never_reported_as_success_and_recovers_after_repair(ledger, monkeypatch):
+    """append 寫出一半 bytes 才失敗：重跑必須拒絕（不得得到 valid=[1,3]＋壞行＋回報成功）；
+    人把半筆尾巴修掉之後重跑要補齊 1、2、3。"""
+    t = NOW - 5000
+    client = FakeClient([_row(t - 10, tran=1), _row(t, tran=2), _row(t + 10, tran=3)])
+    real_append = ledger.append
+    state = {"n": 0}
+
+    def torn(event_type, **fields):
+        state["n"] += 1
+        if state["n"] == 2:
+            line = json.dumps({"event_type": event_type, **fields}, sort_keys=True)
+            with ledger.path.open("a", encoding="utf-8") as handle:
+                handle.write(line[: len(line) // 2])  # half a line, then the "disk fills up"
+            raise OSError("no space left on device")
+        return real_append(event_type, **fields)
+
+    monkeypatch.setattr(ledger, "append", torn)
+    with pytest.raises(OSError):
+        sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW)
+    monkeypatch.undo()
+
+    with pytest.raises(FundingLedgerError):
+        sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW)
+    assert _tran_ids_safe(ledger) == [1]  # nothing was glued on, nothing new written
+
+    raw = ledger.path.read_bytes()  # the repair a person would do: cut the torn tail
+    ledger.path.write_bytes(raw[: raw.rfind(b"\n") + 1])
+    assert sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW) == 2
+    assert _tran_ids(ledger) == [1, 2, 3]
+
+
+def _tran_ids_safe(ledger):
+    """只數完整的行（壞尾巴不算）。"""
+    out = []
+    for line in ledger.path.read_bytes().split(b"\n")[:-1]:
+        out.append(json.loads(line)["tran_id"])
+    return out
+
+
+def test_rows_are_written_oldest_first_even_if_the_exchange_returns_them_shuffled(ledger):
+    client = FakeClient([])
+    client.income_history = lambda **kw: [_row(NOW - 10, tran=3), _row(NOW - 30, tran=1), _row(NOW - 20, tran=2)]
+    assert sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW) == 3
+    assert _tran_ids(ledger) == [1, 2, 3]
+
+
+def test_total_refuses_a_damaged_ledger_instead_of_returning_a_short_number(ledger):
+    sync_funding_fees(FakeClient([_row(NOW - 30, "-0.5", tran=1)]), ledger, "BTCUSDT", now_ms=NOW)
+    _tear_tail(ledger)
+    with pytest.raises(FundingLedgerError):
+        total_funding_fee(str(ledger.path))

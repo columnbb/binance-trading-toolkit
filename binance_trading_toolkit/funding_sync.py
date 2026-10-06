@@ -48,18 +48,43 @@ def _record_id(row: dict[str, Any], symbol: str) -> str:
     return f"{row.get('symbol') or symbol}:{row.get('time')}:{row.get('tranId')}"
 
 
-def _existing_funding_state(ledger: TradeLedger, symbol: str) -> tuple[set[Any], int | None]:
-    existing_ids: set[Any] = set()
-    max_settle_ms: int | None = None
+class FundingLedgerError(RuntimeError):
+    """帳本檔不完整（半筆 JSON、尾端沒有換行、或有讀不懂的行）。同步在這種狀態下
+    一律停手（fail closed）：不補寫、不回報成功，等人把帳本修復後再重跑。"""
+
+
+def _read_events(ledger: TradeLedger) -> list[dict[str, Any]]:
+    """讀整份帳本；只要有任何一行讀不懂、或檔案尾端沒有換行就丟 FundingLedgerError。
+
+    為什麼不略過壞行：append 中途被中斷（磁碟滿等）可能留下沒有換行的半筆 JSON，
+    略過它、把新事件接在它後面會讓兩筆黏成一行無效 JSON，而續跑起點（最大結算時間）
+    已經前進，那筆資金費就永遠漏記。帳本尾端自動修復不在這個函式的範圍內。
+    """
     if not ledger.path.exists():
-        return existing_ids, max_settle_ms
-    for line in ledger.path.read_text(encoding="utf-8").splitlines():
+        return []
+    raw = ledger.path.read_bytes()
+    if raw and not raw.endswith(b"\n"):
+        raise FundingLedgerError(
+            f"{ledger.path}: last line has no trailing newline (torn write?); repair the ledger before syncing"
+        )
+    events: list[dict[str, Any]] = []
+    for number, line in enumerate(raw.decode("utf-8", errors="strict").splitlines(), 1):
         if not line.strip():
             continue
         try:
             event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+        except json.JSONDecodeError as exc:
+            raise FundingLedgerError(f"{ledger.path}:{number}: unreadable ledger line ({exc.msg}); repair before syncing") from exc
+        if not isinstance(event, dict):
+            raise FundingLedgerError(f"{ledger.path}:{number}: ledger line is not a JSON object")
+        events.append(event)
+    return events
+
+
+def _existing_funding_state(ledger: TradeLedger, symbol: str) -> tuple[set[Any], int | None]:
+    existing_ids: set[Any] = set()
+    max_settle_ms: int | None = None
+    for event in _read_events(ledger):
         if event.get("event_type") != "funding_fee" or event.get("symbol") != symbol:
             continue
         if event.get("source") != SOURCE:
@@ -85,7 +110,7 @@ def _fetch_window(client, symbol: str, start_time_ms: int, end_time_ms: int, pag
         rows.extend(got)
         if len(got) < page_size:
             return rows
-    raise RuntimeError(f"funding income for {symbol} exceeds {MAX_PAGES} pages; refusing a partial sync")
+    raise RuntimeError(f"funding income for {symbol} still not exhausted after {MAX_PAGES} pages; refusing a partial sync")
 
 
 def _validate(row: Any, symbol: str) -> tuple[str, float, int]:
@@ -111,7 +136,7 @@ def sync_funding_fees(
 ) -> int:
     """查詢自上次記錄以來的新資金費結算，寫進帳本，回傳新寫入的筆數。
 
-    三個保證：
+    四個保證：
     1. 整個時間窗（用 ``page`` 翻頁）全部取回、每一列都驗證通過才開始寫；
        任何一列壞掉（金額不是有限數字、時間不可讀）整輪丟 ValueError、什麼都不寫。
     2. 起點是已記錄的最大結算時間「本身」（含頭），不是＋1：同一毫秒還沒記到的
@@ -119,9 +144,12 @@ def sync_funding_fees(
        中斷時，沒寫到的列時間一定不小於已寫的最大時間，重跑補得回來。
     3. 只認 ``source="binance_income"`` 的既有事件決定起點，別的來源的列不會把
        起點推到未來。
+    4. 帳本本身不完整（半筆 JSON、尾端沒換行、讀不懂的行）就丟
+       ``FundingLedgerError``、什麼都不寫——「中斷後重跑能補回」只涵蓋「整筆事件
+       沒寫出去」；寫到一半留下的半筆 JSON 需要人修復帳本後再跑，不自動修復。
     """
     now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
-    existing_ids, max_settle_ms = _existing_funding_state(ledger, symbol)
+    existing_ids, max_settle_ms = _existing_funding_state(ledger, symbol)  # fails closed on a damaged ledger
     start_time_ms = max_settle_ms if max_settle_ms is not None else (now_ms - lookback_ms)
 
     rows = _fetch_window(client, symbol, start_time_ms, now_ms, page_size)
@@ -153,18 +181,10 @@ def sync_funding_fees(
 
 
 def total_funding_fee(ledger_path: str, *, asset: str = "USDT") -> float:
-    """帳本裡該資產的資金費淨額（只加總 ``asset`` 吻合或未標資產的列）。"""
+    """帳本裡該資產的資金費淨額（只加總 ``asset`` 吻合或未標資產的列）。
+    帳本不完整時丟 FundingLedgerError，不回傳一個少算的數字。"""
     total = 0.0
-    path = TradeLedger(ledger_path).path
-    if not path.exists():
-        return total
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    for event in _read_events(TradeLedger(ledger_path)):
         if event.get("event_type") != "funding_fee":
             continue
         if event.get("asset") not in (None, asset):
