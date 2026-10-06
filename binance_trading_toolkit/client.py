@@ -453,9 +453,9 @@ class BinanceFuturesClient:
         1000 筆；時間邊界含頭尾。**分頁用 ``page``（固定同一個時間窗往後翻），
         不要把 ``startTime`` 推到上一頁最後一筆之後**——同一毫秒可以有好幾列，
         往前推會漏掉還沒回傳的同毫秒尾端。
-        2026-10-06 只在 Demo Trading 網址確認端點存在、參數被接受（當時
-        區間內沒有資金費列），正式站的回應格式尚未用真實資金費列核對；
-        ``page`` 參數依官方文件，尚未實測。
+        2026-10-06 在 Demo 與正式站（唯讀）確認 ``FUNDING_FEE`` 列的欄位格式與上述一致；
+        Demo 接受 ``page``（第 2 頁回空）；不存在的 ASCII 幣名回 HTTP 400「Invalid symbol」；
+        不帶 ``symbol`` 就是整個帳戶。多頁真實資料的分頁行為尚未驗過。
         """
         return self._signed("GET", "/fapi/v1/income", {
             "incomeType": income_type, "symbol": symbol,

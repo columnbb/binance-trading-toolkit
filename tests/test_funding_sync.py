@@ -309,3 +309,51 @@ def test_total_refuses_a_damaged_ledger_instead_of_returning_a_short_number(ledg
     _tear_tail(ledger)
     with pytest.raises(FundingLedgerError):
         total_funding_fee(str(ledger.path))
+
+
+# ---- 整個帳戶（symbol=None）模式與審閱留下的非阻擋事項 ----
+
+def test_account_wide_sync_records_every_symbol_and_is_idempotent(ledger):
+    rows = [_row(NOW - 300, "-0.1", tran=1, symbol="BTCUSDT"), _row(NOW - 200, "0.2", tran=2, symbol="ZENUSDT"),
+            _row(NOW - 100, "-0.3", tran=3, symbol="ETHUSDT")]
+    client = FakeClient(rows)
+    assert sync_funding_fees(client, ledger, None, now_ms=NOW) == 3
+    assert client.calls[0]["symbol"] is None and client.calls[0]["income_type"] == "FUNDING_FEE"
+    assert [e["symbol"] for e in _events(ledger)] == ["BTCUSDT", "ZENUSDT", "ETHUSDT"]
+    assert sync_funding_fees(client, ledger, None, now_ms=NOW) == 0
+    assert client.calls[-1]["start"] == NOW - 100  # newest settlement across ALL symbols, inclusive
+    assert total_funding_fee(str(ledger.path)) == pytest.approx(-0.2)
+
+
+def test_account_wide_resume_picks_up_a_late_row_on_the_newest_millisecond(ledger):
+    t = NOW - 100
+    client = FakeClient([_row(t, tran=1, symbol="BTCUSDT")])
+    assert sync_funding_fees(client, ledger, None, now_ms=NOW) == 1
+    client.rows.append(_row(t, tran=2, symbol="ZENUSDT"))
+    assert sync_funding_fees(client, ledger, None, now_ms=NOW) == 1
+    assert sorted(_tran_ids(ledger)) == [1, 2]
+
+
+def test_account_wide_sync_rejects_a_row_without_a_symbol(ledger):
+    client = FakeClient([])
+    bad = _row(NOW - 100, tran=1)
+    del bad["symbol"]
+    client.income_history = lambda **kw: [_row(NOW - 200, tran=2), bad]
+    with pytest.raises(ValueError):
+        sync_funding_fees(client, ledger, None, now_ms=NOW)
+    assert _events(ledger) == []
+
+
+def test_symbol_mode_still_ignores_other_symbols_in_the_ledger(ledger):
+    sync_funding_fees(FakeClient([_row(NOW - 100, tran=1, symbol="ETHUSDT")]), ledger, "ETHUSDT", now_ms=NOW)
+    client = FakeClient([_row(NOW - 500, tran=2, symbol="BTCUSDT")])
+    assert sync_funding_fees(client, ledger, "BTCUSDT", now_ms=NOW) == 1
+    assert client.calls[0]["start"] == NOW - DEFAULT_LOOKBACK_MS  # ETH rows must not move BTC's start
+
+
+def test_invalid_utf8_in_the_ledger_is_a_ledger_error_not_a_unicode_error(ledger):
+    ledger.path.write_bytes(b'{"event_type": "x"}\n\xff\xfe\n')
+    with pytest.raises(FundingLedgerError):
+        sync_funding_fees(FakeClient([]), ledger, "BTCUSDT", now_ms=NOW)
+    with pytest.raises(FundingLedgerError):
+        total_funding_fee(str(ledger.path))
