@@ -240,5 +240,9 @@ Binance 的資金費結算只出現在收益紀錄（`incomeType=FUNDING_FEE`）
 以 symbol＋時間＋tranId 去重（tranId 在不同收益類型間會重複，不能單獨當鍵）。
 官方只回最近 3 個月，第一次執行預設回看 85 天。
 
-**驗證狀態：** 只在 Demo Trading 網址確認端點存在、參數被接受（當時區間沒有資金費列，
-所以回應欄位以官方文件為準），正式站的資金費列尚未核對；單元測試用假客戶端回放。
+**驗證狀態（2026-10-06）：** 在 Demo 與正式站（A1 金鑰、唯讀）確認 `FUNDING_FEE` 列的欄位格式與官方文件
+一致（`symbol`／`incomeType`／`income` 字串／`asset`=USDT／`time` 毫秒／`tranId`／`tradeId` 空字串）；
+Demo 的 `page` 參數被接受（第 2 頁回空）；不存在的 ASCII 幣名會回 HTTP 400「Invalid symbol」，
+不指定 symbol 則是整個帳戶。**還沒驗過**多頁真實資料的分頁行為（正式站資料不到一頁）。
+`symbol=None` 是整個帳戶一次查，給專用帳戶用。帳本有壞行或尾端沒換行時一律 `FundingLedgerError`
+停手，要人工修復帳本後再跑。

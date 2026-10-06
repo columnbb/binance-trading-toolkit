@@ -42,7 +42,7 @@ def _iso_from_epoch_ms(value: Any) -> str | None:
     return datetime.fromtimestamp(milliseconds / 1000, tz=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def _record_id(row: dict[str, Any], symbol: str) -> str:
+def _record_id(row: dict[str, Any], symbol: str | None) -> str:
     """tranId 在不同收益類型之間會重複（同一筆成交的手續費與已實現損益共用），
     所以用 symbol＋時間＋tranId 組成去重鍵，不單靠 tranId。"""
     return f"{row.get('symbol') or symbol}:{row.get('time')}:{row.get('tranId')}"
@@ -63,12 +63,16 @@ def _read_events(ledger: TradeLedger) -> list[dict[str, Any]]:
     if not ledger.path.exists():
         return []
     raw = ledger.path.read_bytes()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise FundingLedgerError(f"{ledger.path}: ledger is not valid UTF-8 ({exc.reason}); repair before syncing") from exc
     if raw and not raw.endswith(b"\n"):
         raise FundingLedgerError(
             f"{ledger.path}: last line has no trailing newline (torn write?); repair the ledger before syncing"
         )
     events: list[dict[str, Any]] = []
-    for number, line in enumerate(raw.decode("utf-8", errors="strict").splitlines(), 1):
+    for number, line in enumerate(text.splitlines(), 1):
         if not line.strip():
             continue
         try:
@@ -81,11 +85,11 @@ def _read_events(ledger: TradeLedger) -> list[dict[str, Any]]:
     return events
 
 
-def _existing_funding_state(ledger: TradeLedger, symbol: str) -> tuple[set[Any], int | None]:
+def _existing_funding_state(ledger: TradeLedger, symbol: str | None) -> tuple[set[Any], int | None]:
     existing_ids: set[Any] = set()
     max_settle_ms: int | None = None
     for event in _read_events(ledger):
-        if event.get("event_type") != "funding_fee" or event.get("symbol") != symbol:
+        if event.get("event_type") != "funding_fee" or (symbol is not None and event.get("symbol") != symbol):
             continue
         if event.get("source") != SOURCE:
             continue
@@ -98,7 +102,7 @@ def _existing_funding_state(ledger: TradeLedger, symbol: str) -> tuple[set[Any],
     return existing_ids, max_settle_ms
 
 
-def _fetch_window(client, symbol: str, start_time_ms: int, end_time_ms: int, page_size: int) -> list[dict[str, Any]]:
+def _fetch_window(client, symbol: str | None, start_time_ms: int, end_time_ms: int, page_size: int) -> list[dict[str, Any]]:
     """同一個固定時間窗用 ``page`` 往後翻到最後一頁；整個窗口的資料都拿到才回傳。
     不把 startTime 往前推——同一毫秒可以有好幾列，往前推會漏掉同毫秒尾端。"""
     rows: list[dict[str, Any]] = []
@@ -110,10 +114,10 @@ def _fetch_window(client, symbol: str, start_time_ms: int, end_time_ms: int, pag
         rows.extend(got)
         if len(got) < page_size:
             return rows
-    raise RuntimeError(f"funding income for {symbol} still not exhausted after {MAX_PAGES} pages; refusing a partial sync")
+    raise RuntimeError(f"funding income for {symbol or 'the whole account'} still not exhausted after {MAX_PAGES} pages; refusing a partial sync")
 
 
-def _validate(row: Any, symbol: str) -> tuple[str, float, int]:
+def _validate(row: Any, symbol: str | None) -> tuple[str, float, int]:
     """寫入前驗證；任何一列壞掉整輪就不寫。回傳 (record_id, funding, settle_ms)。"""
     if not isinstance(row, dict):
         raise ValueError(f"unreadable funding row for {symbol}: {row!r}")
@@ -126,15 +130,21 @@ def _validate(row: Any, symbol: str) -> tuple[str, float, int]:
         raise ValueError(f"unreadable funding income {row.get('income')!r} for {symbol}")
     if not math.isfinite(funding):
         raise ValueError(f"non-finite funding income {row.get('income')!r} for {symbol}")
+    if symbol is None and not (isinstance(row.get("symbol"), str) and row["symbol"]):
+        raise ValueError(f"funding row without a symbol in an account-wide sync: {row!r}")
     return _record_id(row, symbol), funding, int(settle_ms)
 
 
 def sync_funding_fees(
-    client: BinanceFuturesClient, ledger: TradeLedger, symbol: str,
+    client: BinanceFuturesClient, ledger: TradeLedger, symbol: str | None,
     *, lookback_ms: int = DEFAULT_LOOKBACK_MS, now_ms: int | None = None,
     page_size: int = PAGE_SIZE,
 ) -> int:
     """查詢自上次記錄以來的新資金費結算，寫進帳本，回傳新寫入的筆數。
+
+    ``symbol=None`` 是整個帳戶一次查（專用帳戶用：不需要事先知道有哪些 symbol，
+    也不會因為帳本裡混有別的交易所時期的幣名而被「Invalid symbol」打斷）；起點與去重
+    都改看所有 ``source="binance_income"`` 的資金費事件。同一份帳本不要混用兩種模式。
 
     四個保證：
     1. 整個時間窗（用 ``page`` 翻頁）全部取回、每一列都驗證通過才開始寫；
