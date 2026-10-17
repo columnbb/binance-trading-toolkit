@@ -577,11 +577,24 @@ def extract_filters(symbol_info: dict[str, Any]) -> tuple[float | None, float | 
 
 
 def round_to_step(quantity: float, step: float | None) -> float:
-    """把數量無條件捨去到最小變動單位（跟 sepa_vcp_screener/risk/position.py 一致）。"""
+    """把數量（或價格）無條件捨去到最小變動單位。
+
+    用十進位（``Decimal``）算，不用浮點除法：``85721.9 / 0.1`` 在浮點是
+    ``857218.9999999999``，舊寫法 ``math.floor(quantity / step) * step`` 會把一個
+    本來就對齊的價格多捨去一檔（85721.9 → 85721.8；數量 0.043 → 0.042，約 13% 的數量、
+    三成的價格會中）。2026-10-17 A1 加密策略首筆真倉的停損價被這樣少了一檔才發現。
+
+    ``step`` 為 None 或 ≤ 0 時原樣回傳；數量不是有限數字就丟 ``ValueError``（不靜默回傳 nan）。
+    """
+    import math
+    from decimal import ROUND_FLOOR, Decimal
+
     if not step or step <= 0:
         return quantity
-    import math
-    return math.floor(quantity / step) * step
+    if not math.isfinite(quantity) or not math.isfinite(step):
+        raise ValueError(f"round_to_step needs finite numbers, got quantity={quantity!r} step={step!r}")
+    units = (Decimal(repr(float(quantity))) / Decimal(repr(float(step)))).to_integral_value(rounding=ROUND_FLOOR)
+    return float(units * Decimal(repr(float(step))))
 
 
 def confirmed_fill(trades: list[dict[str, Any]], order_id: int) -> dict[str, Any] | None:
