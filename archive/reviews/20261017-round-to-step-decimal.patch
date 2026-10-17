@@ -1,0 +1,127 @@
+diff --git a/binance_trading_toolkit/__init__.py b/binance_trading_toolkit/__init__.py
+index e0c2e1d..6033d0c 100644
+--- a/binance_trading_toolkit/__init__.py
++++ b/binance_trading_toolkit/__init__.py
+@@ -17,7 +17,7 @@ from .smoke_test import SmokeTestAborted, quantity_for_notional, run_smoke_test
+ # Bump this (and pyproject.toml) whenever the code changes: pip treats an unchanged version
+ # as already satisfied, so a persistent CI runner or host keeps the old code when only the
+ # pinned commit moves (2026-10-06: momentum CI kept a 0.3.3 without funding_sync).
+-__version__ = "0.4.0"
++__version__ = "0.4.1"
+ 
+ __all__ = [
+     "BinanceFuturesClient", "BinanceConfig", "BinanceAPIError", "OrderResult",
+diff --git a/binance_trading_toolkit/client.py b/binance_trading_toolkit/client.py
+index d041faa..cef19e8 100644
+--- a/binance_trading_toolkit/client.py
++++ b/binance_trading_toolkit/client.py
+@@ -577,11 +577,24 @@ def extract_filters(symbol_info: dict[str, Any]) -> tuple[float | None, float |
+ 
+ 
+ def round_to_step(quantity: float, step: float | None) -> float:
+-    """把數量無條件捨去到最小變動單位（跟 sepa_vcp_screener/risk/position.py 一致）。"""
++    """把數量（或價格）無條件捨去到最小變動單位。
++
++    用十進位（``Decimal``）算，不用浮點除法：``85721.9 / 0.1`` 在浮點是
++    ``857218.9999999999``，舊寫法 ``math.floor(quantity / step) * step`` 會把一個
++    本來就對齊的價格多捨去一檔（85721.9 → 85721.8；數量 0.043 → 0.042，約 13% 的數量、
++    三成的價格會中）。2026-10-17 A1 加密策略首筆真倉的停損價被這樣少了一檔才發現。
++
++    ``step`` 為 None 或 ≤ 0 時原樣回傳；數量不是有限數字就丟 ``ValueError``（不靜默回傳 nan）。
++    """
++    import math
++    from decimal import ROUND_FLOOR, Decimal
++
+     if not step or step <= 0:
+         return quantity
+-    import math
+-    return math.floor(quantity / step) * step
++    if not math.isfinite(quantity) or not math.isfinite(step):
++        raise ValueError(f"round_to_step needs finite numbers, got quantity={quantity!r} step={step!r}")
++    units = (Decimal(repr(float(quantity))) / Decimal(repr(float(step)))).to_integral_value(rounding=ROUND_FLOOR)
++    return float(units * Decimal(repr(float(step))))
+ 
+ 
+ def confirmed_fill(trades: list[dict[str, Any]], order_id: int) -> dict[str, Any] | None:
+diff --git a/pyproject.toml b/pyproject.toml
+index 59a1363..25d9f2c 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,6 +1,6 @@
+ [project]
+ name = "binance-trading-toolkit"
+-version = "0.4.0"
++version = "0.4.1"
+ description = "Shared Binance USDⓈ-M futures client with stable-ID order observation, native stops, position query, and audit utilities"
+ requires-python = ">=3.11"
+ dependencies = [
+diff --git a/tests/test_round_to_step.py b/tests/test_round_to_step.py
+new file mode 100644
+index 0000000..dd175b0
+--- /dev/null
++++ b/tests/test_round_to_step.py
+@@ -0,0 +1,64 @@
++"""round_to_step must floor in decimal, not float.
++
++``math.floor(85721.9 / 0.1) * 0.1`` is 85721.8: the old float version dropped a whole tick (price) or lot
++(quantity) off values that were already aligned -- found on the first real-money stop of the crypto strategy
++on 2026-10-17.  These tests compare against exact Decimal arithmetic over whole ranges, not a few examples.
++"""
++from decimal import ROUND_FLOOR, Decimal
++
++import pytest
++
++from binance_trading_toolkit import round_to_step
++
++
++def _exact(value: str, step: str) -> float:
++    return float((Decimal(value) / Decimal(step)).to_integral_value(rounding=ROUND_FLOOR) * Decimal(step))
++
++
++def test_the_value_that_was_wrong_in_production():
++    assert round_to_step(85721.9, 0.1) == 85721.9
++    assert round_to_step(81639.9, 0.1) == 81639.9
++    assert round_to_step(0.043, 0.001) == 0.043
++    assert round_to_step(0.0589, 0.0001) == 0.0589
++
++
++def test_every_aligned_btc_price_survives_a_tick_of_0_1():
++    for k in range(300000, 1500000):          # 30,000.0 .. 150,000.0 in ticks of 0.1
++        price = float(f"{k / 10:.1f}")
++        assert round_to_step(price, 0.1) == price, price
++
++
++def test_every_aligned_quantity_survives_steps_of_0_001_and_0_0001():
++    for k in range(1, 20000):
++        qty = float(f"{k / 1000:.3f}")
++        assert round_to_step(qty, 0.001) == qty, qty
++    for k in range(1, 20000):
++        qty = float(f"{k / 10000:.4f}")
++        assert round_to_step(qty, 0.0001) == qty, qty
++
++
++@pytest.mark.parametrize("value,step", [("85721.95", "0.1"), ("85721.99", "0.1"), ("0.0439", "0.001"),
++                                        ("1.23456", "0.001"), ("0.00109", "0.0001"), ("5.5", "1"), ("6.999", "1")])
++def test_unaligned_values_floor_down_to_the_step(value, step):
++    assert round_to_step(float(value), float(step)) == _exact(value, step)
++    assert round_to_step(float(value), float(step)) <= float(value)
++
++
++def test_never_rounds_up_and_never_drops_more_than_one_step():
++    step = 0.001
++    for k in range(1, 5000):
++        qty = k / 1000 + 0.0004                  # always strictly between two lots
++        out = round_to_step(qty, step)
++        assert out <= qty and qty - out < step + 1e-12
++
++
++def test_no_step_passes_through():
++    assert round_to_step(1.2345, None) == 1.2345
++    assert round_to_step(1.2345, 0) == 1.2345
++    assert round_to_step(1.2345, -0.1) == 1.2345
++
++
++@pytest.mark.parametrize("quantity,step", [(float("nan"), 0.1), (float("inf"), 0.1), (1.0, float("inf")), (1.0, float("nan"))])
++def test_non_finite_input_is_an_error_not_a_silent_nan(quantity, step):
++    with pytest.raises(ValueError):
++        round_to_step(quantity, step)
