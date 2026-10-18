@@ -23,7 +23,7 @@ import time
 import uuid
 from typing import Any
 
-from .client import BinanceFuturesClient, extract_filters
+from .client import BinanceFuturesClient, extract_filters, round_to_step
 from .ledger import TradeLedger
 
 LOG = logging.getLogger(__name__)
@@ -38,8 +38,44 @@ def quantity_for_notional(step_size: float | None, price: float, notional: float
     raw = notional / price
     if not step_size or step_size <= 0:
         return raw
+    return round_to_step(raw, step_size)          # 十進位；舊的 math.floor(raw / step) * step 會把對齊的數量多捨一檔
+
+
+def stop_price_below_entry(entry_price: float, stop_offset_pct: float, tick_size: float | None) -> float:
+    """進場價往下 ``stop_offset_pct`` 的停損價，無條件捨去到最小價格變動單位。
+
+    全程用十進位，直到對齊 tick 之後才轉成 float：``float(exact)`` 是「最近值」捨入，會把略低於 tick 邊界的
+    精確值變成剛好在邊界上（進場價 1.0、偏移 0.10000000000000002、tick 0.1 → 精確值 0.89999…，
+    先轉 float 會變 0.9，停損價就高於精確上界），所以不能先轉再對齊。
+    """
     import math
-    return math.floor(raw / step_size) * step_size
+    from decimal import ROUND_FLOOR, Decimal
+
+    if not math.isfinite(entry_price) or not math.isfinite(stop_offset_pct):
+        raise ValueError(f"stop_price_below_entry needs finite numbers, got entry_price={entry_price!r} "
+                         f"stop_offset_pct={stop_offset_pct!r}")
+    exact = Decimal(repr(float(entry_price))) * (1 - Decimal(repr(float(stop_offset_pct))))
+    if not tick_size or tick_size <= 0:
+        return _not_above(exact, float(exact))
+    if not math.isfinite(tick_size):
+        raise ValueError(f"stop_price_below_entry needs a finite tick_size, got {tick_size!r}")
+    tick = Decimal(repr(float(tick_size)))
+    aligned = (exact / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+    return _not_above(exact, float(aligned))
+
+
+def _not_above(exact: "Decimal", candidate: float) -> float:
+    """``candidate`` 是 Decimal 值轉成的 float（最近值捨入，可能比 ``exact`` 高一點點）；若它的 ``repr`` 高於
+    ``exact`` 就往下退一個 float，直到不再高於為止。一般的 tick（0.1、0.01 …）對齊後的值轉 float 再 ``repr`` 會
+    原樣還原，這裡不會動它；只有位數多到 float 放不下的怪 tick 才會退。"""
+    import math
+    from decimal import Decimal
+
+    for _ in range(4):                           # one step is enough in practice; the bound keeps it from looping
+        if Decimal(repr(candidate)) <= exact:
+            return candidate
+        candidate = math.nextafter(candidate, -math.inf)
+    raise ArithmeticError(f"could not bring {candidate!r} to or below {exact}")
 
 
 def _market(
@@ -124,10 +160,7 @@ def run_smoke_test(
             fee=0.0, order_id=entry_order_id, source="binance_trading_toolkit_smoke_test",
         )
 
-        stop_price = entry_price * (1 - stop_offset_pct)
-        if tick_size:
-            import math
-            stop_price = math.floor(stop_price / tick_size) * tick_size
+        stop_price = stop_price_below_entry(entry_price, stop_offset_pct, tick_size)
         stop_attempt = ledger.order_attempt(
             action="smoke_place_stop", symbol=symbol, side="SELL", volume=0, live=True,
             order_type="STOP_MARKET", parameters={"stop_price": stop_price, "position_side": position_side},

@@ -131,6 +131,34 @@ class TestOrderPricingNeverRisksAFill:
         assert all(o["price"] <= safe_price + 0.5 for o in client.limit_orders)
 
 
+class TestRoundingIsDecimalNotFloat:
+    """The float floor/ceil these used (math.floor(x / step) * step) dropped or added a whole tick/lot on aligned values."""
+
+    def test_an_aligned_safe_price_is_not_floored_a_tick(self, ledger):
+        # half of 171443.8 is 85721.9, already on the 0.1 tick: the old float floor priced the order at 85721.8
+        client = FakeClient(positions=[], price=171443.8)
+        run_gate1_validation(client, ledger, symbol="BTCUSDT", confirm=True)
+        assert client.limit_orders[0]["price"] == 85721.9
+
+    @pytest.mark.parametrize("price", [2000.0, 4000.0, 50000.0, 171443.8])
+    def test_the_test_order_quantity_is_the_exact_decimal_ceiling_and_clears_min_notional(self, ledger, price):
+        # No price tried here makes the old math.ceil add a lot (the bug is real for round_up_to_step, see
+        # test_round_to_step.py); this pins that the order is sized by exact decimal arithmetic and never below min_notional.
+        from decimal import ROUND_CEILING, Decimal
+        client = FakeClient(positions=[], price=price)
+        run_gate1_validation(client, ledger, symbol="BTCUSDT", confirm=True)
+        order = client.limit_orders[0]
+        target = Decimal(repr(50.0 * 1.2))
+        exact = float((target / Decimal(repr(order["price"])) / Decimal("0.001")).to_integral_value(rounding=ROUND_CEILING)
+                      * Decimal("0.001"))
+        assert order["quantity"] == pytest.approx(exact, abs=1e-12) and order["quantity"] * order["price"] >= 50.0
+
+    def test_every_order_still_prices_at_or_below_half_market(self, ledger):
+        client = FakeClient(positions=[], price=171443.8)
+        run_gate1_validation(client, ledger, symbol="BTCUSDT", confirm=True)
+        assert all(o["price"] <= 171443.8 * 0.5 + 0.5 for o in client.limit_orders)
+
+
 class TestClientOrderIdLength:
     """Regression test for a real bug hit during a live demo-account run: a
     client_order_id longer than Binance's 36-char limit made every error-case

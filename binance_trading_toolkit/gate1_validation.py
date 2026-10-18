@@ -18,11 +18,10 @@
 from __future__ import annotations
 
 import logging
-import math
 import uuid
 from typing import Any
 
-from .client import BinanceFuturesClient, extract_filters
+from .client import BinanceFuturesClient, extract_filters, round_to_step, round_up_to_step
 from .ledger import TradeLedger
 
 LOG = logging.getLogger(__name__)
@@ -123,9 +122,7 @@ def run_gate1_validation(
     # 2. 真的掛一張限價單，再用 cancel_order()（非 algo 端點）取消
     #    掛在市價的一半（BUY）——正常行情不可能瞬間腰斬，成交風險視為零。
     # ------------------------------------------------------------------
-    safe_price = price * 0.5
-    if tick_size:
-        safe_price = math.floor(safe_price / tick_size) * tick_size
+    safe_price = round_to_step(price * 0.5, tick_size)
     # 20% buffer over min_notional, then round UP (not down) to the step
     # size — flooring here was the bug: for a coarse step_size relative to
     # price, flooring can undershoot back below min_notional (e.g. step=0.001
@@ -134,7 +131,7 @@ def run_gate1_validation(
     target_notional = max(min_notional or 0.0, 20.0) * 1.2
     quantity = target_notional / safe_price
     if step_size:
-        quantity = math.ceil(quantity / step_size) * step_size
+        quantity = round_up_to_step(quantity, step_size)
 
     cancel_order_id = None
     try:
@@ -187,7 +184,7 @@ def run_gate1_validation(
         # would reintroduce fill risk on a BUY order, which defeats the
         # entire point of using `safe_price` in the first place.
         step = step_size or 0.001
-        tiny_qty = math.floor((min_notional * 0.5 / safe_price) / step) * step
+        tiny_qty = round_to_step(min_notional * 0.5 / safe_price, step)
         if tiny_qty <= 0:
             LOG.warning("gate1_min_notional_case_skipped symbol=%s reason=step_size_too_coarse_to_go_below_min_notional_at_safe_price", symbol)
         else:
@@ -212,7 +209,7 @@ def run_gate1_validation(
     oversized_notional = max(available * 100.0, 1_000_000.0)
     oversized_qty = oversized_notional / safe_price
     if step_size:
-        oversized_qty = math.floor(oversized_qty / step_size) * step_size
+        oversized_qty = round_to_step(oversized_qty, step_size)
     error_cases.append(_record_error_case(
         ledger, case="insufficient_margin", symbol=symbol, side="BUY",
         quantity=oversized_qty, price=safe_price, client=client, position_side=position_side,

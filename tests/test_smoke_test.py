@@ -9,7 +9,11 @@ from __future__ import annotations
 import pytest
 
 from binance_trading_toolkit.ledger import TradeLedger
-from binance_trading_toolkit.smoke_test import SmokeTestAborted, quantity_for_notional, run_smoke_test
+from decimal import ROUND_FLOOR, Decimal
+
+from binance_trading_toolkit.smoke_test import (
+    SmokeTestAborted, quantity_for_notional, run_smoke_test, stop_price_below_entry,
+)
 
 
 class TestQuantityForNotional:
@@ -22,6 +26,74 @@ class TestQuantityForNotional:
 
     def test_zero_step_passes_through(self):
         assert quantity_for_notional(0, price=100.0, notional=50.0) == pytest.approx(0.5)
+
+    def test_an_aligned_quantity_is_not_floored_a_lot(self):
+        # math.floor(0.043 / 0.001) * 0.001 is 0.042: the old float floor dropped a lot off an aligned quantity
+        assert quantity_for_notional(0.001, price=1.0, notional=0.043) == 0.043
+        assert quantity_for_notional(0.0001, price=1.0, notional=0.0589) == 0.0589
+
+
+class TestStopPriceBelowEntry:
+    @staticmethod
+    def _exact(entry: float, offset: float, tick: float) -> float:
+        stop = Decimal(repr(entry)) * (1 - Decimal(repr(offset)))
+        return float((stop / Decimal(repr(tick))).to_integral_value(rounding=ROUND_FLOOR) * Decimal(repr(tick)))
+
+    def test_matches_exact_decimal_arithmetic_over_a_whole_range_of_btc_entries(self):
+        for k in range(300000, 900000, 7):          # 30,000.0 .. 90,000.0 in steps of 0.7
+            entry = k / 10
+            assert stop_price_below_entry(entry, 0.05, 0.1) == self._exact(entry, 0.05, 0.1), entry
+
+    def test_the_price_is_clean_not_float_noise(self):
+        # 30000.7 * 0.95 floored the old way gave 28500.600000000002
+        assert stop_price_below_entry(30000.7, 0.05, 0.1) == 28500.6
+
+    def test_never_above_the_exact_stop_and_below_entry(self):
+        for entry in (30000.7, 81639.9, 85721.9):
+            stop = stop_price_below_entry(entry, 0.05, 0.1)
+            assert stop < entry and stop <= entry * 0.95 + 1e-9
+
+    def test_a_value_just_below_a_tick_edge_is_not_rounded_up_by_a_float_conversion(self):
+        # exact product 0.89999999999999998 -- float() of it is 0.9, which would sit ON the edge and floor to 0.9 (above
+        # the exact stop); the decimal value must be floored to 0.8 before anything becomes a float
+        assert stop_price_below_entry(1.0, 0.10000000000000002, 0.1) == 0.8
+
+    def test_never_above_the_exact_decimal_stop_over_awkward_offsets(self):
+        for entry in (1.0, 0.7, 3.3, 30000.7, 85721.9):
+            for offset in (0.1, 0.10000000000000002, 0.05, 0.07, 0.15000000000000002, 0.01):
+                exact = Decimal(repr(entry)) * (1 - Decimal(repr(offset)))
+                stop = Decimal(repr(stop_price_below_entry(entry, offset, 0.1)))
+                assert stop <= exact, (entry, offset)
+                assert exact - stop < Decimal("0.1"), (entry, offset)
+
+    def test_the_final_float_never_reads_above_the_exact_stop_even_for_an_odd_tick(self):
+        # the aligned decimal 0.24691357802469132 has no float of that repr; float() rounds it UP to ...133
+        entry, offset, tick = 0.2743484200274348, 0.1, 0.12345678901234566
+        exact = Decimal(repr(entry)) * (1 - Decimal(repr(offset)))
+        stop = stop_price_below_entry(entry, offset, tick)
+        assert Decimal(repr(stop)) <= exact
+        assert exact - Decimal(repr(stop)) < Decimal("1e-15")           # and only one float step lower, not a tick
+
+    def test_ordinary_ticks_are_untouched_by_the_final_guard(self):
+        import random
+        rng = random.Random(7)
+        for _ in range(20000):
+            entry = round(rng.uniform(0.5, 150000), rng.choice([1, 2, 3]))
+            offset = rng.choice([0.01, 0.02, 0.05, 0.07, 0.1, 0.15, 0.2])
+            for tick in (0.1, 0.01, 0.001, 0.0001, 0.5, 1.0):
+                exact = Decimal(repr(entry)) * (1 - Decimal(repr(offset)))
+                tick_d = Decimal(repr(tick))
+                want = float((exact / tick_d).to_integral_value(rounding=ROUND_FLOOR) * tick_d)
+                assert stop_price_below_entry(entry, offset, tick) == want, (entry, offset, tick)
+
+    @pytest.mark.parametrize("entry,offset,tick", [(float("nan"), 0.05, 0.1), (100.0, float("inf"), 0.1),
+                                                   (float("inf"), 0.05, 0.1), (100.0, 0.05, float("nan"))])
+    def test_non_finite_input_is_an_error(self, entry, offset, tick):
+        with pytest.raises(ValueError):
+            stop_price_below_entry(entry, offset, tick)
+
+    def test_no_tick_size_keeps_the_exact_product(self):
+        assert stop_price_below_entry(100.0, 0.05, None) == 95.0
 
 
 class FakeClient:
