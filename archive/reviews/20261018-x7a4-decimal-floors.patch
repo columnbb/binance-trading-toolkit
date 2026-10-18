@@ -1,0 +1,389 @@
+diff --git a/binance_trading_toolkit/__init__.py b/binance_trading_toolkit/__init__.py
+index 6033d0c..bde2ce4 100644
+--- a/binance_trading_toolkit/__init__.py
++++ b/binance_trading_toolkit/__init__.py
+@@ -8,6 +8,7 @@ from .client import (
+     confirmed_fill,
+     extract_filters,
+     round_to_step,
++    round_up_to_step,
+ )
+ from .gate1_validation import Gate1ValidationAborted, run_gate1_validation
+ from .ledger import TradeLedger
+@@ -17,11 +18,11 @@ from .smoke_test import SmokeTestAborted, quantity_for_notional, run_smoke_test
+ # Bump this (and pyproject.toml) whenever the code changes: pip treats an unchanged version
+ # as already satisfied, so a persistent CI runner or host keeps the old code when only the
+ # pinned commit moves (2026-10-06: momentum CI kept a 0.3.3 without funding_sync).
+-__version__ = "0.4.1"
++__version__ = "0.4.2"
+ 
+ __all__ = [
+     "BinanceFuturesClient", "BinanceConfig", "BinanceAPIError", "OrderResult",
+-    "extract_filters", "round_to_step", "confirmed_fill",
++    "extract_filters", "round_to_step", "round_up_to_step", "confirmed_fill",
+     "TradeLedger",
+     "generate_report", "load_events",
+     "run_smoke_test", "SmokeTestAborted", "quantity_for_notional",
+diff --git a/binance_trading_toolkit/client.py b/binance_trading_toolkit/client.py
+index cef19e8..888ea0e 100644
+--- a/binance_trading_toolkit/client.py
++++ b/binance_trading_toolkit/client.py
+@@ -597,6 +597,23 @@ def round_to_step(quantity: float, step: float | None) -> float:
+     return float(units * Decimal(repr(float(step))))
+ 
+ 
++def round_up_to_step(quantity: float, step: float | None) -> float:
++    """``round_to_step`` 的反方向：無條件進位到最小變動單位，同樣用十進位。
++
++    ``0.12 / 0.001`` 在浮點是 ``120.00000000000001``，``math.ceil`` 會把本來就對齊的數量多進一檔
++    （0.12 → 0.121）。``step`` 為 None 或 ≤ 0 時原樣回傳；不是有限數字就丟 ``ValueError``。
++    """
++    import math
++    from decimal import ROUND_CEILING, Decimal
++
++    if not step or step <= 0:
++        return quantity
++    if not math.isfinite(quantity) or not math.isfinite(step):
++        raise ValueError(f"round_up_to_step needs finite numbers, got quantity={quantity!r} step={step!r}")
++    units = (Decimal(repr(float(quantity))) / Decimal(repr(float(step)))).to_integral_value(rounding=ROUND_CEILING)
++    return float(units * Decimal(repr(float(step))))
++
++
+ def confirmed_fill(trades: list[dict[str, Any]], order_id: int) -> dict[str, Any] | None:
+     """把 ``user_trades()`` 回傳的成交明細，篩出屬於指定 ``order_id`` 的那些筆，
+     彙總成這張訂單的確認成交資訊：成交量加權平均價、總成交量、總手續費。
+diff --git a/binance_trading_toolkit/gate1_validation.py b/binance_trading_toolkit/gate1_validation.py
+index 875a881..a89df6a 100644
+--- a/binance_trading_toolkit/gate1_validation.py
++++ b/binance_trading_toolkit/gate1_validation.py
+@@ -18,11 +18,10 @@
+ from __future__ import annotations
+ 
+ import logging
+-import math
+ import uuid
+ from typing import Any
+ 
+-from .client import BinanceFuturesClient, extract_filters
++from .client import BinanceFuturesClient, extract_filters, round_to_step, round_up_to_step
+ from .ledger import TradeLedger
+ 
+ LOG = logging.getLogger(__name__)
+@@ -123,9 +122,7 @@ def run_gate1_validation(
+     # 2. 真的掛一張限價單，再用 cancel_order()（非 algo 端點）取消
+     #    掛在市價的一半（BUY）——正常行情不可能瞬間腰斬，成交風險視為零。
+     # ------------------------------------------------------------------
+-    safe_price = price * 0.5
+-    if tick_size:
+-        safe_price = math.floor(safe_price / tick_size) * tick_size
++    safe_price = round_to_step(price * 0.5, tick_size)
+     # 20% buffer over min_notional, then round UP (not down) to the step
+     # size — flooring here was the bug: for a coarse step_size relative to
+     # price, flooring can undershoot back below min_notional (e.g. step=0.001
+@@ -134,7 +131,7 @@ def run_gate1_validation(
+     target_notional = max(min_notional or 0.0, 20.0) * 1.2
+     quantity = target_notional / safe_price
+     if step_size:
+-        quantity = math.ceil(quantity / step_size) * step_size
++        quantity = round_up_to_step(quantity, step_size)
+ 
+     cancel_order_id = None
+     try:
+@@ -187,7 +184,7 @@ def run_gate1_validation(
+         # would reintroduce fill risk on a BUY order, which defeats the
+         # entire point of using `safe_price` in the first place.
+         step = step_size or 0.001
+-        tiny_qty = math.floor((min_notional * 0.5 / safe_price) / step) * step
++        tiny_qty = round_to_step(min_notional * 0.5 / safe_price, step)
+         if tiny_qty <= 0:
+             LOG.warning("gate1_min_notional_case_skipped symbol=%s reason=step_size_too_coarse_to_go_below_min_notional_at_safe_price", symbol)
+         else:
+@@ -212,7 +209,7 @@ def run_gate1_validation(
+     oversized_notional = max(available * 100.0, 1_000_000.0)
+     oversized_qty = oversized_notional / safe_price
+     if step_size:
+-        oversized_qty = math.floor(oversized_qty / step_size) * step_size
++        oversized_qty = round_to_step(oversized_qty, step_size)
+     error_cases.append(_record_error_case(
+         ledger, case="insufficient_margin", symbol=symbol, side="BUY",
+         quantity=oversized_qty, price=safe_price, client=client, position_side=position_side,
+diff --git a/binance_trading_toolkit/smoke_test.py b/binance_trading_toolkit/smoke_test.py
+index e52728b..1b1db94 100644
+--- a/binance_trading_toolkit/smoke_test.py
++++ b/binance_trading_toolkit/smoke_test.py
+@@ -23,7 +23,7 @@ import time
+ import uuid
+ from typing import Any
+ 
+-from .client import BinanceFuturesClient, extract_filters
++from .client import BinanceFuturesClient, extract_filters, round_to_step
+ from .ledger import TradeLedger
+ 
+ LOG = logging.getLogger(__name__)
+@@ -38,8 +38,44 @@ def quantity_for_notional(step_size: float | None, price: float, notional: float
+     raw = notional / price
+     if not step_size or step_size <= 0:
+         return raw
++    return round_to_step(raw, step_size)          # 十進位；舊的 math.floor(raw / step) * step 會把對齊的數量多捨一檔
++
++
++def stop_price_below_entry(entry_price: float, stop_offset_pct: float, tick_size: float | None) -> float:
++    """進場價往下 ``stop_offset_pct`` 的停損價，無條件捨去到最小價格變動單位。
++
++    全程用十進位，直到對齊 tick 之後才轉成 float：``float(exact)`` 是「最近值」捨入，會把略低於 tick 邊界的
++    精確值變成剛好在邊界上（進場價 1.0、偏移 0.10000000000000002、tick 0.1 → 精確值 0.89999…，
++    先轉 float 會變 0.9，停損價就高於精確上界），所以不能先轉再對齊。
++    """
++    import math
++    from decimal import ROUND_FLOOR, Decimal
++
++    if not math.isfinite(entry_price) or not math.isfinite(stop_offset_pct):
++        raise ValueError(f"stop_price_below_entry needs finite numbers, got entry_price={entry_price!r} "
++                         f"stop_offset_pct={stop_offset_pct!r}")
++    exact = Decimal(repr(float(entry_price))) * (1 - Decimal(repr(float(stop_offset_pct))))
++    if not tick_size or tick_size <= 0:
++        return _not_above(exact, float(exact))
++    if not math.isfinite(tick_size):
++        raise ValueError(f"stop_price_below_entry needs a finite tick_size, got {tick_size!r}")
++    tick = Decimal(repr(float(tick_size)))
++    aligned = (exact / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
++    return _not_above(exact, float(aligned))
++
++
++def _not_above(exact: "Decimal", candidate: float) -> float:
++    """``candidate`` 是 Decimal 值轉成的 float（最近值捨入，可能比 ``exact`` 高一點點）；若它的 ``repr`` 高於
++    ``exact`` 就往下退一個 float，直到不再高於為止。一般的 tick（0.1、0.01 …）對齊後的值轉 float 再 ``repr`` 會
++    原樣還原，這裡不會動它；只有位數多到 float 放不下的怪 tick 才會退。"""
+     import math
+-    return math.floor(raw / step_size) * step_size
++    from decimal import Decimal
++
++    for _ in range(4):                           # one step is enough in practice; the bound keeps it from looping
++        if Decimal(repr(candidate)) <= exact:
++            return candidate
++        candidate = math.nextafter(candidate, -math.inf)
++    raise ArithmeticError(f"could not bring {candidate!r} to or below {exact}")
+ 
+ 
+ def _market(
+@@ -124,10 +160,7 @@ def run_smoke_test(
+             fee=0.0, order_id=entry_order_id, source="binance_trading_toolkit_smoke_test",
+         )
+ 
+-        stop_price = entry_price * (1 - stop_offset_pct)
+-        if tick_size:
+-            import math
+-            stop_price = math.floor(stop_price / tick_size) * tick_size
++        stop_price = stop_price_below_entry(entry_price, stop_offset_pct, tick_size)
+         stop_attempt = ledger.order_attempt(
+             action="smoke_place_stop", symbol=symbol, side="SELL", volume=0, live=True,
+             order_type="STOP_MARKET", parameters={"stop_price": stop_price, "position_side": position_side},
+diff --git a/pyproject.toml b/pyproject.toml
+index 25d9f2c..6a667b0 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,6 +1,6 @@
+ [project]
+ name = "binance-trading-toolkit"
+-version = "0.4.1"
++version = "0.4.2"
+ description = "Shared Binance USDⓈ-M futures client with stable-ID order observation, native stops, position query, and audit utilities"
+ requires-python = ">=3.11"
+ dependencies = [
+diff --git a/tests/test_gate1_validation.py b/tests/test_gate1_validation.py
+index 6518322..dddf026 100644
+--- a/tests/test_gate1_validation.py
++++ b/tests/test_gate1_validation.py
+@@ -131,6 +131,34 @@ class TestOrderPricingNeverRisksAFill:
+         assert all(o["price"] <= safe_price + 0.5 for o in client.limit_orders)
+ 
+ 
++class TestRoundingIsDecimalNotFloat:
++    """The float floor/ceil these used (math.floor(x / step) * step) dropped or added a whole tick/lot on aligned values."""
++
++    def test_an_aligned_safe_price_is_not_floored_a_tick(self, ledger):
++        # half of 171443.8 is 85721.9, already on the 0.1 tick: the old float floor priced the order at 85721.8
++        client = FakeClient(positions=[], price=171443.8)
++        run_gate1_validation(client, ledger, symbol="BTCUSDT", confirm=True)
++        assert client.limit_orders[0]["price"] == 85721.9
++
++    @pytest.mark.parametrize("price", [2000.0, 4000.0, 50000.0, 171443.8])
++    def test_the_test_order_quantity_is_the_exact_decimal_ceiling_and_clears_min_notional(self, ledger, price):
++        # No price tried here makes the old math.ceil add a lot (the bug is real for round_up_to_step, see
++        # test_round_to_step.py); this pins that the order is sized by exact decimal arithmetic and never below min_notional.
++        from decimal import ROUND_CEILING, Decimal
++        client = FakeClient(positions=[], price=price)
++        run_gate1_validation(client, ledger, symbol="BTCUSDT", confirm=True)
++        order = client.limit_orders[0]
++        target = Decimal(repr(50.0 * 1.2))
++        exact = float((target / Decimal(repr(order["price"])) / Decimal("0.001")).to_integral_value(rounding=ROUND_CEILING)
++                      * Decimal("0.001"))
++        assert order["quantity"] == pytest.approx(exact, abs=1e-12) and order["quantity"] * order["price"] >= 50.0
++
++    def test_every_order_still_prices_at_or_below_half_market(self, ledger):
++        client = FakeClient(positions=[], price=171443.8)
++        run_gate1_validation(client, ledger, symbol="BTCUSDT", confirm=True)
++        assert all(o["price"] <= 171443.8 * 0.5 + 0.5 for o in client.limit_orders)
++
++
+ class TestClientOrderIdLength:
+     """Regression test for a real bug hit during a live demo-account run: a
+     client_order_id longer than Binance's 36-char limit made every error-case
+diff --git a/tests/test_round_to_step.py b/tests/test_round_to_step.py
+index dd175b0..e885b66 100644
+--- a/tests/test_round_to_step.py
++++ b/tests/test_round_to_step.py
+@@ -4,11 +4,11 @@
+ (quantity) off values that were already aligned -- found on the first real-money stop of the crypto strategy
+ on 2026-10-17.  These tests compare against exact Decimal arithmetic over whole ranges, not a few examples.
+ """
+-from decimal import ROUND_FLOOR, Decimal
++from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+ 
+ import pytest
+ 
+-from binance_trading_toolkit import round_to_step
++from binance_trading_toolkit import round_to_step, round_up_to_step
+ 
+ 
+ def _exact(value: str, step: str) -> float:
+@@ -62,3 +62,47 @@ def test_no_step_passes_through():
+ def test_non_finite_input_is_an_error_not_a_silent_nan(quantity, step):
+     with pytest.raises(ValueError):
+         round_to_step(quantity, step)
++
++
++# --- round_up_to_step: the same bug in the other direction (gate1 sized its test order with math.ceil) ----------------
++
++def _exact_up(value: str, step: str) -> float:
++    return float((Decimal(value) / Decimal(step)).to_integral_value(rounding=ROUND_CEILING) * Decimal(step))
++
++
++def test_an_aligned_quantity_is_not_rounded_up_a_lot():
++    # math.ceil(4.001 / 0.001) * 0.001 is 4.002: one whole lot too many
++    assert round_up_to_step(4.001, 0.001) == 4.001
++    assert round_up_to_step(4.009, 0.001) == 4.009
++
++
++def test_every_aligned_quantity_survives_round_up_for_steps_of_0_001_and_0_0001():
++    for k in range(1, 20000):
++        qty = float(f"{k / 1000:.3f}")
++        assert round_up_to_step(qty, 0.001) == qty, qty
++    for k in range(1, 20000):
++        qty = float(f"{k / 10000:.4f}")
++        assert round_up_to_step(qty, 0.0001) == qty, qty
++
++
++@pytest.mark.parametrize("value,step", [("85721.95", "0.1"), ("0.0439", "0.001"), ("1.23456", "0.001"),
++                                        ("0.00109", "0.0001"), ("5.5", "1"), ("6.001", "1")])
++def test_unaligned_values_round_up_to_the_step(value, step):
++    assert round_up_to_step(float(value), float(step)) == _exact_up(value, step)
++    assert round_up_to_step(float(value), float(step)) >= float(value)
++
++
++def test_round_up_never_drops_and_never_adds_more_than_one_step():
++    step = 0.001
++    for k in range(1, 5000):
++        qty = k / 1000 + 0.0004
++        out = round_up_to_step(qty, step)
++        assert out >= qty and out - qty < step + 1e-12
++
++
++def test_round_up_without_a_step_passes_through_and_rejects_non_finite():
++    assert round_up_to_step(1.2345, None) == 1.2345
++    assert round_up_to_step(1.2345, 0) == 1.2345
++    for bad in (float("nan"), float("inf")):
++        with pytest.raises(ValueError):
++            round_up_to_step(bad, 0.1)
+diff --git a/tests/test_smoke_test.py b/tests/test_smoke_test.py
+index 4c6d69b..a2f735b 100644
+--- a/tests/test_smoke_test.py
++++ b/tests/test_smoke_test.py
+@@ -9,7 +9,11 @@ from __future__ import annotations
+ import pytest
+ 
+ from binance_trading_toolkit.ledger import TradeLedger
+-from binance_trading_toolkit.smoke_test import SmokeTestAborted, quantity_for_notional, run_smoke_test
++from decimal import ROUND_FLOOR, Decimal
++
++from binance_trading_toolkit.smoke_test import (
++    SmokeTestAborted, quantity_for_notional, run_smoke_test, stop_price_below_entry,
++)
+ 
+ 
+ class TestQuantityForNotional:
+@@ -23,6 +27,74 @@ class TestQuantityForNotional:
+     def test_zero_step_passes_through(self):
+         assert quantity_for_notional(0, price=100.0, notional=50.0) == pytest.approx(0.5)
+ 
++    def test_an_aligned_quantity_is_not_floored_a_lot(self):
++        # math.floor(0.043 / 0.001) * 0.001 is 0.042: the old float floor dropped a lot off an aligned quantity
++        assert quantity_for_notional(0.001, price=1.0, notional=0.043) == 0.043
++        assert quantity_for_notional(0.0001, price=1.0, notional=0.0589) == 0.0589
++
++
++class TestStopPriceBelowEntry:
++    @staticmethod
++    def _exact(entry: float, offset: float, tick: float) -> float:
++        stop = Decimal(repr(entry)) * (1 - Decimal(repr(offset)))
++        return float((stop / Decimal(repr(tick))).to_integral_value(rounding=ROUND_FLOOR) * Decimal(repr(tick)))
++
++    def test_matches_exact_decimal_arithmetic_over_a_whole_range_of_btc_entries(self):
++        for k in range(300000, 900000, 7):          # 30,000.0 .. 90,000.0 in steps of 0.7
++            entry = k / 10
++            assert stop_price_below_entry(entry, 0.05, 0.1) == self._exact(entry, 0.05, 0.1), entry
++
++    def test_the_price_is_clean_not_float_noise(self):
++        # 30000.7 * 0.95 floored the old way gave 28500.600000000002
++        assert stop_price_below_entry(30000.7, 0.05, 0.1) == 28500.6
++
++    def test_never_above_the_exact_stop_and_below_entry(self):
++        for entry in (30000.7, 81639.9, 85721.9):
++            stop = stop_price_below_entry(entry, 0.05, 0.1)
++            assert stop < entry and stop <= entry * 0.95 + 1e-9
++
++    def test_a_value_just_below_a_tick_edge_is_not_rounded_up_by_a_float_conversion(self):
++        # exact product 0.89999999999999998 -- float() of it is 0.9, which would sit ON the edge and floor to 0.9 (above
++        # the exact stop); the decimal value must be floored to 0.8 before anything becomes a float
++        assert stop_price_below_entry(1.0, 0.10000000000000002, 0.1) == 0.8
++
++    def test_never_above_the_exact_decimal_stop_over_awkward_offsets(self):
++        for entry in (1.0, 0.7, 3.3, 30000.7, 85721.9):
++            for offset in (0.1, 0.10000000000000002, 0.05, 0.07, 0.15000000000000002, 0.01):
++                exact = Decimal(repr(entry)) * (1 - Decimal(repr(offset)))
++                stop = Decimal(repr(stop_price_below_entry(entry, offset, 0.1)))
++                assert stop <= exact, (entry, offset)
++                assert exact - stop < Decimal("0.1"), (entry, offset)
++
++    def test_the_final_float_never_reads_above_the_exact_stop_even_for_an_odd_tick(self):
++        # the aligned decimal 0.24691357802469132 has no float of that repr; float() rounds it UP to ...133
++        entry, offset, tick = 0.2743484200274348, 0.1, 0.12345678901234566
++        exact = Decimal(repr(entry)) * (1 - Decimal(repr(offset)))
++        stop = stop_price_below_entry(entry, offset, tick)
++        assert Decimal(repr(stop)) <= exact
++        assert exact - Decimal(repr(stop)) < Decimal("1e-15")           # and only one float step lower, not a tick
++
++    def test_ordinary_ticks_are_untouched_by_the_final_guard(self):
++        import random
++        rng = random.Random(7)
++        for _ in range(20000):
++            entry = round(rng.uniform(0.5, 150000), rng.choice([1, 2, 3]))
++            offset = rng.choice([0.01, 0.02, 0.05, 0.07, 0.1, 0.15, 0.2])
++            for tick in (0.1, 0.01, 0.001, 0.0001, 0.5, 1.0):
++                exact = Decimal(repr(entry)) * (1 - Decimal(repr(offset)))
++                tick_d = Decimal(repr(tick))
++                want = float((exact / tick_d).to_integral_value(rounding=ROUND_FLOOR) * tick_d)
++                assert stop_price_below_entry(entry, offset, tick) == want, (entry, offset, tick)
++
++    @pytest.mark.parametrize("entry,offset,tick", [(float("nan"), 0.05, 0.1), (100.0, float("inf"), 0.1),
++                                                   (float("inf"), 0.05, 0.1), (100.0, 0.05, float("nan"))])
++    def test_non_finite_input_is_an_error(self, entry, offset, tick):
++        with pytest.raises(ValueError):
++            stop_price_below_entry(entry, offset, tick)
++
++    def test_no_tick_size_keeps_the_exact_product(self):
++        assert stop_price_below_entry(100.0, 0.05, None) == 95.0
++
+ 
+ class FakeClient:
+     def __init__(self, positions=None, filters=None, price=50000.0):
