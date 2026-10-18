@@ -23,7 +23,7 @@ import time
 import uuid
 from typing import Any
 
-from .client import BinanceFuturesClient, extract_filters
+from .client import BinanceFuturesClient, extract_filters, round_to_step
 from .ledger import TradeLedger
 
 LOG = logging.getLogger(__name__)
@@ -38,8 +38,15 @@ def quantity_for_notional(step_size: float | None, price: float, notional: float
     raw = notional / price
     if not step_size or step_size <= 0:
         return raw
-    import math
-    return math.floor(raw / step_size) * step_size
+    return round_to_step(raw, step_size)          # 十進位；舊的 math.floor(raw / step) * step 會把對齊的數量多捨一檔
+
+
+def stop_price_below_entry(entry_price: float, stop_offset_pct: float, tick_size: float | None) -> float:
+    """進場價往下 ``stop_offset_pct`` 的停損價，捨去到最小價格變動單位；乘法與取整都用十進位。"""
+    from decimal import Decimal
+
+    exact = Decimal(repr(float(entry_price))) * (1 - Decimal(repr(float(stop_offset_pct))))
+    return round_to_step(float(exact), tick_size)
 
 
 def _market(
@@ -124,10 +131,7 @@ def run_smoke_test(
             fee=0.0, order_id=entry_order_id, source="binance_trading_toolkit_smoke_test",
         )
 
-        stop_price = entry_price * (1 - stop_offset_pct)
-        if tick_size:
-            import math
-            stop_price = math.floor(stop_price / tick_size) * tick_size
+        stop_price = stop_price_below_entry(entry_price, stop_offset_pct, tick_size)
         stop_attempt = ledger.order_attempt(
             action="smoke_place_stop", symbol=symbol, side="SELL", volume=0, live=True,
             order_type="STOP_MARKET", parameters={"stop_price": stop_price, "position_side": position_side},

@@ -9,7 +9,11 @@ from __future__ import annotations
 import pytest
 
 from binance_trading_toolkit.ledger import TradeLedger
-from binance_trading_toolkit.smoke_test import SmokeTestAborted, quantity_for_notional, run_smoke_test
+from decimal import ROUND_FLOOR, Decimal
+
+from binance_trading_toolkit.smoke_test import (
+    SmokeTestAborted, quantity_for_notional, run_smoke_test, stop_price_below_entry,
+)
 
 
 class TestQuantityForNotional:
@@ -22,6 +26,35 @@ class TestQuantityForNotional:
 
     def test_zero_step_passes_through(self):
         assert quantity_for_notional(0, price=100.0, notional=50.0) == pytest.approx(0.5)
+
+    def test_an_aligned_quantity_is_not_floored_a_lot(self):
+        # math.floor(0.043 / 0.001) * 0.001 is 0.042: the old float floor dropped a lot off an aligned quantity
+        assert quantity_for_notional(0.001, price=1.0, notional=0.043) == 0.043
+        assert quantity_for_notional(0.0001, price=1.0, notional=0.0589) == 0.0589
+
+
+class TestStopPriceBelowEntry:
+    @staticmethod
+    def _exact(entry: float, offset: float, tick: float) -> float:
+        stop = Decimal(repr(entry)) * (1 - Decimal(repr(offset)))
+        return float((stop / Decimal(repr(tick))).to_integral_value(rounding=ROUND_FLOOR) * Decimal(repr(tick)))
+
+    def test_matches_exact_decimal_arithmetic_over_a_whole_range_of_btc_entries(self):
+        for k in range(300000, 900000, 7):          # 30,000.0 .. 90,000.0 in steps of 0.7
+            entry = k / 10
+            assert stop_price_below_entry(entry, 0.05, 0.1) == self._exact(entry, 0.05, 0.1), entry
+
+    def test_the_price_is_clean_not_float_noise(self):
+        # 30000.7 * 0.95 floored the old way gave 28500.600000000002
+        assert stop_price_below_entry(30000.7, 0.05, 0.1) == 28500.6
+
+    def test_never_above_the_exact_stop_and_below_entry(self):
+        for entry in (30000.7, 81639.9, 85721.9):
+            stop = stop_price_below_entry(entry, 0.05, 0.1)
+            assert stop < entry and stop <= entry * 0.95 + 1e-9
+
+    def test_no_tick_size_keeps_the_exact_product(self):
+        assert stop_price_below_entry(100.0, 0.05, None) == 95.0
 
 
 class FakeClient:

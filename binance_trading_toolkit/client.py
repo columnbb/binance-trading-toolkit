@@ -597,6 +597,23 @@ def round_to_step(quantity: float, step: float | None) -> float:
     return float(units * Decimal(repr(float(step))))
 
 
+def round_up_to_step(quantity: float, step: float | None) -> float:
+    """``round_to_step`` 的反方向：無條件進位到最小變動單位，同樣用十進位。
+
+    ``0.12 / 0.001`` 在浮點是 ``120.00000000000001``，``math.ceil`` 會把本來就對齊的數量多進一檔
+    （0.12 → 0.121）。``step`` 為 None 或 ≤ 0 時原樣回傳；不是有限數字就丟 ``ValueError``。
+    """
+    import math
+    from decimal import ROUND_CEILING, Decimal
+
+    if not step or step <= 0:
+        return quantity
+    if not math.isfinite(quantity) or not math.isfinite(step):
+        raise ValueError(f"round_up_to_step needs finite numbers, got quantity={quantity!r} step={step!r}")
+    units = (Decimal(repr(float(quantity))) / Decimal(repr(float(step)))).to_integral_value(rounding=ROUND_CEILING)
+    return float(units * Decimal(repr(float(step))))
+
+
 def confirmed_fill(trades: list[dict[str, Any]], order_id: int) -> dict[str, Any] | None:
     """把 ``user_trades()`` 回傳的成交明細，篩出屬於指定 ``order_id`` 的那些筆，
     彙總成這張訂單的確認成交資訊：成交量加權平均價、總成交量、總手續費。
