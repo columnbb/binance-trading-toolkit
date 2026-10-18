@@ -66,6 +66,26 @@ class TestStopPriceBelowEntry:
                 assert stop <= exact, (entry, offset)
                 assert exact - stop < Decimal("0.1"), (entry, offset)
 
+    def test_the_final_float_never_reads_above_the_exact_stop_even_for_an_odd_tick(self):
+        # the aligned decimal 0.24691357802469132 has no float of that repr; float() rounds it UP to ...133
+        entry, offset, tick = 0.2743484200274348, 0.1, 0.12345678901234566
+        exact = Decimal(repr(entry)) * (1 - Decimal(repr(offset)))
+        stop = stop_price_below_entry(entry, offset, tick)
+        assert Decimal(repr(stop)) <= exact
+        assert exact - Decimal(repr(stop)) < Decimal("1e-15")           # and only one float step lower, not a tick
+
+    def test_ordinary_ticks_are_untouched_by_the_final_guard(self):
+        import random
+        rng = random.Random(7)
+        for _ in range(20000):
+            entry = round(rng.uniform(0.5, 150000), rng.choice([1, 2, 3]))
+            offset = rng.choice([0.01, 0.02, 0.05, 0.07, 0.1, 0.15, 0.2])
+            for tick in (0.1, 0.01, 0.001, 0.0001, 0.5, 1.0):
+                exact = Decimal(repr(entry)) * (1 - Decimal(repr(offset)))
+                tick_d = Decimal(repr(tick))
+                want = float((exact / tick_d).to_integral_value(rounding=ROUND_FLOOR) * tick_d)
+                assert stop_price_below_entry(entry, offset, tick) == want, (entry, offset, tick)
+
     @pytest.mark.parametrize("entry,offset,tick", [(float("nan"), 0.05, 0.1), (100.0, float("inf"), 0.1),
                                                    (float("inf"), 0.05, 0.1), (100.0, 0.05, float("nan"))])
     def test_non_finite_input_is_an_error(self, entry, offset, tick):

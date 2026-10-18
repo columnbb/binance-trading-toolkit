@@ -56,11 +56,26 @@ def stop_price_below_entry(entry_price: float, stop_offset_pct: float, tick_size
                          f"stop_offset_pct={stop_offset_pct!r}")
     exact = Decimal(repr(float(entry_price))) * (1 - Decimal(repr(float(stop_offset_pct))))
     if not tick_size or tick_size <= 0:
-        return float(exact)
+        return _not_above(exact, float(exact))
     if not math.isfinite(tick_size):
         raise ValueError(f"stop_price_below_entry needs a finite tick_size, got {tick_size!r}")
     tick = Decimal(repr(float(tick_size)))
-    return float((exact / tick).to_integral_value(rounding=ROUND_FLOOR) * tick)
+    aligned = (exact / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+    return _not_above(exact, float(aligned))
+
+
+def _not_above(exact: "Decimal", candidate: float) -> float:
+    """``candidate`` 是 Decimal 值轉成的 float（最近值捨入，可能比 ``exact`` 高一點點）；若它的 ``repr`` 高於
+    ``exact`` 就往下退一個 float，直到不再高於為止。一般的 tick（0.1、0.01 …）對齊後的值轉 float 再 ``repr`` 會
+    原樣還原，這裡不會動它；只有位數多到 float 放不下的怪 tick 才會退。"""
+    import math
+    from decimal import Decimal
+
+    for _ in range(4):                           # one step is enough in practice; the bound keeps it from looping
+        if Decimal(repr(candidate)) <= exact:
+            return candidate
+        candidate = math.nextafter(candidate, -math.inf)
+    raise ArithmeticError(f"could not bring {candidate!r} to or below {exact}")
 
 
 def _market(
