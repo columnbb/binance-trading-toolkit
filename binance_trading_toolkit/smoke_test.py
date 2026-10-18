@@ -42,11 +42,25 @@ def quantity_for_notional(step_size: float | None, price: float, notional: float
 
 
 def stop_price_below_entry(entry_price: float, stop_offset_pct: float, tick_size: float | None) -> float:
-    """進場價往下 ``stop_offset_pct`` 的停損價，捨去到最小價格變動單位；乘法與取整都用十進位。"""
-    from decimal import Decimal
+    """進場價往下 ``stop_offset_pct`` 的停損價，無條件捨去到最小價格變動單位。
 
+    全程用十進位，直到對齊 tick 之後才轉成 float：``float(exact)`` 是「最近值」捨入，會把略低於 tick 邊界的
+    精確值變成剛好在邊界上（進場價 1.0、偏移 0.10000000000000002、tick 0.1 → 精確值 0.89999…，
+    先轉 float 會變 0.9，停損價就高於精確上界），所以不能先轉再對齊。
+    """
+    import math
+    from decimal import ROUND_FLOOR, Decimal
+
+    if not math.isfinite(entry_price) or not math.isfinite(stop_offset_pct):
+        raise ValueError(f"stop_price_below_entry needs finite numbers, got entry_price={entry_price!r} "
+                         f"stop_offset_pct={stop_offset_pct!r}")
     exact = Decimal(repr(float(entry_price))) * (1 - Decimal(repr(float(stop_offset_pct))))
-    return round_to_step(float(exact), tick_size)
+    if not tick_size or tick_size <= 0:
+        return float(exact)
+    if not math.isfinite(tick_size):
+        raise ValueError(f"stop_price_below_entry needs a finite tick_size, got {tick_size!r}")
+    tick = Decimal(repr(float(tick_size)))
+    return float((exact / tick).to_integral_value(rounding=ROUND_FLOOR) * tick)
 
 
 def _market(

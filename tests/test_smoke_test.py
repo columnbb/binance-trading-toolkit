@@ -53,6 +53,25 @@ class TestStopPriceBelowEntry:
             stop = stop_price_below_entry(entry, 0.05, 0.1)
             assert stop < entry and stop <= entry * 0.95 + 1e-9
 
+    def test_a_value_just_below_a_tick_edge_is_not_rounded_up_by_a_float_conversion(self):
+        # exact product 0.89999999999999998 -- float() of it is 0.9, which would sit ON the edge and floor to 0.9 (above
+        # the exact stop); the decimal value must be floored to 0.8 before anything becomes a float
+        assert stop_price_below_entry(1.0, 0.10000000000000002, 0.1) == 0.8
+
+    def test_never_above_the_exact_decimal_stop_over_awkward_offsets(self):
+        for entry in (1.0, 0.7, 3.3, 30000.7, 85721.9):
+            for offset in (0.1, 0.10000000000000002, 0.05, 0.07, 0.15000000000000002, 0.01):
+                exact = Decimal(repr(entry)) * (1 - Decimal(repr(offset)))
+                stop = Decimal(repr(stop_price_below_entry(entry, offset, 0.1)))
+                assert stop <= exact, (entry, offset)
+                assert exact - stop < Decimal("0.1"), (entry, offset)
+
+    @pytest.mark.parametrize("entry,offset,tick", [(float("nan"), 0.05, 0.1), (100.0, float("inf"), 0.1),
+                                                   (float("inf"), 0.05, 0.1), (100.0, 0.05, float("nan"))])
+    def test_non_finite_input_is_an_error(self, entry, offset, tick):
+        with pytest.raises(ValueError):
+            stop_price_below_entry(entry, offset, tick)
+
     def test_no_tick_size_keeps_the_exact_product(self):
         assert stop_price_below_entry(100.0, 0.05, None) == 95.0
 
